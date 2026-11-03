@@ -435,7 +435,6 @@ def compose_prompt(prompt: str, workspace: Path, mode: str, files: list[str]) ->
         lines.append("Keep all changes inside the workspace and within the requested scope.")
     lines.extend(
         [
-            "Do not run git add, git commit, git push, publish, or external destructive actions.",
             "Final report: summarize changes or findings, list files involved, give exact verification commands and results, and identify anything blocked or unverified.",
         ]
     )
