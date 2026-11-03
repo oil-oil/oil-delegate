@@ -21,7 +21,7 @@ metadata:
 
 | 模式 | 适用情况 | 路径 | 默认停止点 |
 | --- | --- | --- | --- |
-| 首次 Onboarding | `run` 返回 `NEEDS_ONBOARDING`，或用户要求重配 | 只读扫描 → 用户确认启用池与默认项 → 保存 | 报告配置后等待任务 |
+| 首次 Onboarding | `run` 返回 `NEEDS_ONBOARDING`，或用户要求重配 | 静默扫描 → 用户确认启用池与默认项 → 保存 | 已有任务继续执行；仅重配时结束 |
 | 新任务 | 把一次分析、评审或修改交给外部 Agent | 整理委托契约 → `run` → 读取结果并验收 | 汇报结论与验证证据 |
 | 续接任务 | 对同一 CLI 的上一轮结果追问或返工 | 核对 runner 与 session ID → `run --session` | 汇报本轮变化 |
 | 配置与诊断 | 查看环境、预览权限或处理失败 | `onboard --scan`、`config`、`run --dry-run` | 给出明确下一步 |
@@ -51,7 +51,9 @@ metadata:
    DELEGATE onboard --enable <claude,workbuddy,antigravity,codex,opencode,dsh,grok,kimi> --default-runner <runner|ask>
    ```
 
-名称不区分大小写，可使用 `cc`（claude）、`wb`（workbuddy）、`agy`（antigravity）、`dsh`、`grok-build`、`kimi-code` 等别名；启用、默认项、委托和二进制路径配置都走同一套解析，保存时统一转为正式 Runner 名。
+名称不区分大小写，启用、默认项、委托和二进制路径配置都走同一套别名解析，保存时统一转为正式 Runner 名；完整映射见 [Runner 适配参考](references/runners.md)。
+
+本次已有待执行任务时，保存后返回步骤 2 继续，不要求用户重发；只有用户只是重配时才停止。
 
 未指定 runner 且没有默认值时，`run` 返回 `NEEDS_RUNNER_CHOICE`。询问本次选择；只有用户同意沉淀偏好时，才运行 `DELEGATE config --set-default-runner <runner>`。
 

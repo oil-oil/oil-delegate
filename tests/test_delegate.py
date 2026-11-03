@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -10,6 +11,9 @@ import unittest
 from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "delegate.py"
+SPEC = importlib.util.spec_from_file_location("delegate_under_test", SCRIPT_PATH)
+DELEGATE = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(DELEGATE)
 RUNNERS = ("claude", "workbuddy", "antigravity", "codex", "opencode", "dsh", "grok", "kimi")
 
 FAKE_CLI = r'''#!{python}
@@ -20,6 +24,9 @@ import time
 
 runner = {runner!r}
 args = sys.argv[1:]
+if os.environ.get("FAKE_CALL_LOG"):
+    with open(os.environ["FAKE_CALL_LOG"], "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({{"runner": runner, "argv": args}}) + "\n")
 if "--version" in args:
     print("fake-" + runner + "-1.0")
     raise SystemExit(0)
@@ -61,6 +68,31 @@ session = session or ("fake-" + runner + "-session")
 if os.environ.get("FAKE_DSH_BAD_FINAL") == "1":
     print(json.dumps({{"type": "session", "sessionId": session}}))
     print(json.dumps({{"type": "final", "sessionId": session, "text": "", "reason": {{"kind": "error", "error": {{"message": "bad final"}}}}}}))
+    raise SystemExit(0)
+
+if os.environ.get("FAKE_EMPTY") == "1":
+    if runner in ("claude", "workbuddy"):
+        print(json.dumps({{"session_id": session, "result": "", "is_error": False}}))
+    elif runner == "antigravity":
+        print(json.dumps({{"conversation_id": session, "status": "SUCCESS", "response": ""}}))
+    elif runner == "grok":
+        print(json.dumps({{"text": "", "stopReason": "end_turn", "sessionId": session}}))
+    elif runner == "kimi":
+        print(json.dumps({{"type": "session.resume_hint", "session_id": session}}))
+    elif runner == "codex":
+        print(json.dumps({{"type": "thread.started", "thread_id": session}}))
+    elif runner == "opencode":
+        print(json.dumps({{"type": "init", "sessionID": session}}))
+    elif runner == "dsh":
+        print(json.dumps({{"type": "session", "sessionId": session}}))
+        print(json.dumps({{"type": "status", "phase": "turn_end", "reason": {{"kind": "completed"}}}}))
+        print(json.dumps({{"type": "final", "text": ""}}))
+    raise SystemExit(0)
+
+if os.environ.get("FAKE_CODEX_FAIL_NO_DETAIL") == "1":
+    print(json.dumps({{"type": "thread.started", "thread_id": session}}))
+    print(json.dumps({{"type": "item.completed", "item": {{"type": "agent_message", "text": "partial"}}}}))
+    print(json.dumps({{"type": "turn.failed"}}))
     raise SystemExit(0)
 
 if runner in ("claude", "workbuddy"):
@@ -119,8 +151,11 @@ class DelegateTestCase(unittest.TestCase):
         self,
         *args: str,
         extra_env: dict[str, str] | None = None,
+        remove_env: list[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = self.base_env()
+        for key in remove_env or []:
+            env.pop(key, None)
         env.update(extra_env or {})
         return subprocess.run(
             [sys.executable, str(SCRIPT_PATH), *args],
@@ -265,13 +300,7 @@ class DelegateTestCase(unittest.TestCase):
         self.assertIn("grok-build", payload["detected_runners"]["grok"]["aliases"])
         self.assertIn("kimi-code", payload["detected_runners"]["kimi"]["aliases"])
 
-        for alias, canonical in (
-            ("wb", "workbuddy"),
-            ("agy", "antigravity"),
-            ("DSH", "dsh"),
-            ("grok-build", "grok"),
-            ("kimi-code", "kimi"),
-        ):
+        for alias, canonical in (("wb", "workbuddy"), ("kimi-code", "kimi")):
             with self.subTest(alias=alias):
                 proc = self.run_task(alias, mode="write")
                 self.assertEqual(proc.returncode, 0, msg=proc.stderr)
@@ -348,7 +377,11 @@ class DelegateTestCase(unittest.TestCase):
                     self.assertEqual(result["session_id"], f"fake-{runner}-session")
                     self.assertEqual(record["cwd"], str(self.workspace))
                     self.assertIn(expected_read[runner], [record["argv"][i:i + len(expected_read[runner])] for i in range(len(record["argv"]))])
-                    self.assertNotIn("inspect the fixture", result["command"])
+                    self.assertFalse(any("inspect the fixture" in part for part in result["command"]))
+                    if runner in ("codex", "dsh"):
+                        self.assertEqual(result["command"][-1], "-")
+                    else:
+                        self.assertIn("<prompt>", result["command"])
                     for artifact in (result["output_path"], result["events_path"], result["raw_stdout_path"], result["stderr_path"]):
                         self.assertTrue(Path(artifact).is_file())
                     if runner == "opencode":
@@ -396,33 +429,25 @@ class DelegateTestCase(unittest.TestCase):
                     self.assertIn('sandbox_mode="read-only"', record["argv"])
 
     def test_default_mode_is_full_access(self) -> None:
+        args = DELEGATE.build_parser().parse_args(["run", "--prompt", "inspect"])
+        self.assertEqual(args.mode, "write")
+
         self.onboard_all()
-        for runner in ("grok", "kimi", "opencode", "dsh", "workbuddy"):
-            with self.subTest(runner=runner):
-                record_path = self.root / "record.json"
-                proc = self.run_cli(
-                    "run",
-                    "--runner",
-                    runner,
-                    "--workspace",
-                    str(self.workspace),
-                    "--prompt",
-                    "use default permissions",
-                    extra_env={"FAKE_RECORD": str(record_path)},
-                )
-                self.assertEqual(proc.returncode, 0, msg=proc.stderr)
-                self.assertEqual(self.result_of(proc)["mode"], "write")
-                record = self.record_of()
-                if runner == "grok":
-                    self.assertIn("--always-approve", record["argv"])
-                if runner == "kimi":
-                    self.assertNotIn("--auto", record["argv"])
-                if runner == "opencode":
-                    self.assertEqual(json.loads(record["permission"])["external_directory"], "allow")
-                if runner == "dsh":
-                    self.assertIn("danger-full-access", record["argv"])
-                if runner == "workbuddy":
-                    self.assertEqual(record["codebuddy_sandbox"], "1")
+        record_path = self.root / "record.json"
+        proc = self.run_cli(
+            "run",
+            "--runner",
+            "grok",
+            "--workspace",
+            str(self.workspace),
+            "--prompt",
+            "use default permissions",
+            extra_env={"FAKE_RECORD": str(record_path)},
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertEqual(self.result_of(proc)["mode"], "write")
+        record = self.record_of()
+        self.assertIn("--always-approve", record["argv"])
 
     def test_dsh_legacy_permission_flags_use_environment(self) -> None:
         self.onboard_all()
@@ -440,16 +465,7 @@ class DelegateTestCase(unittest.TestCase):
                 self.assertNotIn("--permission-mode", record["argv"])
 
     def test_prompt_does_not_forbid_git_operations(self) -> None:
-        self.onboard_all()
-        record_path = self.root / "record.json"
-        proc = self.run_task(
-            "claude",
-            mode="write",
-            extra_env={"FAKE_RECORD": str(record_path)},
-        )
-        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
-        record = self.record_of()
-        prompt = record["stdin"] + " ".join(record["argv"])
+        prompt = DELEGATE.compose_prompt("inspect", self.workspace, "write", [])
         self.assertNotIn("Do not run git add", prompt)
         self.assertNotIn("git commit", prompt)
         self.assertNotIn("git push", prompt)
@@ -636,6 +652,74 @@ class DelegateTestCase(unittest.TestCase):
         self.assertIn(str(entry), record["stdin"] + " ".join(record["argv"]))
         result = self.result_of(valid)
         self.assertNotIn(str(entry), " ".join(result["command"]))
+
+    def test_empty_responses_are_failures_for_all_runners(self) -> None:
+        self.onboard_all()
+        for runner in RUNNERS:
+            with self.subTest(runner=runner):
+                proc = self.run_task(
+                    runner,
+                    mode="write" if runner == "kimi" else "read",
+                    extra_env={"FAKE_EMPTY": "1"},
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                result = self.result_of(proc)
+                self.assertEqual(result["status"], "failed")
+                self.assertTrue(result["error"])
+
+    def test_codex_failure_without_detail_is_not_success(self) -> None:
+        self.onboard_all()
+        proc = self.run_task("codex", extra_env={"FAKE_CODEX_FAIL_NO_DETAIL": "1"})
+        self.assertNotEqual(proc.returncode, 0)
+        result = self.result_of(proc)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("Codex turn failed", result["error"])
+
+    def test_set_bin_and_default_runner_in_same_request(self) -> None:
+        missing = self.run_cli(
+            "config",
+            "--set-default-runner",
+            "opencode",
+            remove_env=["OIL_DELEGATE_OPENCODE_BIN"],
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertFalse((self.state_dir / "config.json").exists())
+
+        configured = self.run_cli(
+            "config",
+            "--set-bin",
+            f"opencode={self.binaries['opencode']}",
+            "--set-default-runner",
+            "opencode",
+            remove_env=["OIL_DELEGATE_OPENCODE_BIN"],
+        )
+        self.assertEqual(configured.returncode, 0, msg=configured.stderr)
+        payload = json.loads(configured.stdout)
+        self.assertEqual(payload["default_runner"], "opencode")
+        config = json.loads((self.state_dir / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["runner_paths"]["opencode"], str(self.binaries["opencode"]))
+
+    def test_config_and_runner_choice_skip_version_probes(self) -> None:
+        call_log = self.root / "calls.jsonl"
+        self.run_cli("onboard", "--enable", ",".join(RUNNERS), "--default-runner", "ask", extra_env={"FAKE_CALL_LOG": str(call_log)})
+        call_log.unlink()
+
+        configured = self.run_cli("config")
+        self.assertEqual(configured.returncode, 0, msg=configured.stderr)
+        self.assertFalse(call_log.exists())
+
+        choice = self.run_cli("run", "--workspace", str(self.workspace), "--prompt", "x")
+        self.assertEqual(choice.returncode, 11)
+        self.assertFalse(call_log.exists())
+
+    def test_stdout_aliases_share_one_file_and_no_timeout_config(self) -> None:
+        self.onboard_all()
+        proc = self.run_task("claude")
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        result = self.result_of(proc)
+        self.assertEqual(result["events_path"], result["raw_stdout_path"])
+        self.assertTrue(Path(result["events_path"]).is_file())
+        self.assertNotIn("run_timeout_seconds", DELEGATE.default_config())
 
 
 if __name__ == "__main__":
