@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -62,6 +63,19 @@ RUNNER_ALIASES = {
     "grok-build": "grok",
     "kimi-code": "kimi",
 }
+# Bump when the `run --json` result fields change incompatibly.
+CONTRACT_VERSION = 1
+# Interactive commands that reopen a headless session; {bin} is the detected executable name.
+RESUME_TEMPLATES = {
+    "claude": ("{bin}", "--resume", "{sid}"),
+    "workbuddy": ("{bin}", "--resume", "{sid}"),
+    "antigravity": ("{bin}", "--conversation", "{sid}"),
+    "codex": ("{bin}", "resume", "{sid}"),
+    "opencode": ("{bin}", "--session", "{sid}"),
+    "dsh": ("{bin}", "tui", "--resume", "{sid}"),
+    "grok": ("{bin}", "--resume", "{sid}"),
+    "kimi": ("{bin}", "-S", "{sid}"),
+}
 EXIT_NEEDS_ONBOARDING = 10
 EXIT_NEEDS_RUNNER_CHOICE = 11
 DEFAULT_RUN_TIMEOUT = 3600
@@ -82,7 +96,6 @@ def default_config() -> dict[str, Any]:
         "enabled_runners": [],
         "default_runner": None,
         "runner_paths": {},
-        "run_timeout_seconds": DEFAULT_RUN_TIMEOUT,
     }
 
 
@@ -309,34 +322,51 @@ def validate_installed(runners: list[str], config: dict[str, Any]) -> None:
         )
 
 
+def apply_enabled_runners(config: dict[str, Any], raw: str) -> None:
+    enabled = parse_runner_list(raw)
+    validate_installed(enabled, config)
+    config["enabled_runners"] = enabled
+    config["onboarded"] = bool(enabled)
+    if config.get("default_runner") not in enabled:
+        config["default_runner"] = None
+
+
+def apply_default_runner(config: dict[str, Any], raw: str) -> None:
+    value = raw.strip().lower()
+    if value in ("ask", "none", "null", ""):
+        config["default_runner"] = None
+        return
+    runner = canonical_runner(value)
+    validate_installed([runner], config)
+    enabled = list(config.get("enabled_runners", []))
+    if runner not in enabled:
+        enabled.append(runner)
+    config["enabled_runners"] = enabled
+    config["default_runner"] = runner
+    config["onboarded"] = True
+
+
+def config_view_payload(state_dir: Path, config: dict[str, Any]) -> dict[str, Any]:
+    onboarded = bool(config.get("onboarded") and config.get("enabled_runners"))
+    return {
+        "status": "ONBOARDED" if onboarded else "NEEDS_ONBOARDING",
+        "onboarded": onboarded,
+        "state_dir": str(state_dir),
+        "enabled_runners": config.get("enabled_runners", []),
+        "default_runner": config.get("default_runner"),
+        "runner_paths": config.get("runner_paths", {}),
+    }
+
+
 def cmd_onboard(args: argparse.Namespace, state_dir: Path) -> int:
     config = load_config(state_dir)
     changed = args.enable is not None or args.default_runner is not None
     if args.scan and changed:
         raise DelegateError("--scan is read-only and cannot be combined with configuration changes")
-
     if args.enable is not None:
-        enabled = parse_runner_list(args.enable)
-        validate_installed(enabled, config)
-        config["enabled_runners"] = enabled
-        config["onboarded"] = bool(enabled)
-        if config.get("default_runner") not in enabled:
-            config["default_runner"] = None
-
+        apply_enabled_runners(config, args.enable)
     if args.default_runner is not None:
-        value = args.default_runner.strip().lower()
-        if value in ("ask", "none", "null", ""):
-            config["default_runner"] = None
-        else:
-            runner = canonical_runner(value)
-            validate_installed([runner], config)
-            enabled = list(config.get("enabled_runners", []))
-            if runner not in enabled:
-                enabled.append(runner)
-            config["enabled_runners"] = enabled
-            config["default_runner"] = runner
-            config["onboarded"] = True
-
+        apply_default_runner(config, args.default_runner)
     if changed:
         save_config(state_dir, config)
     print(json.dumps(onboarding_payload(state_dir, config), ensure_ascii=False, indent=2))
@@ -355,31 +385,14 @@ def parse_bin_assignment(value: str) -> tuple[str, str]:
 
 def cmd_config(args: argparse.Namespace, state_dir: Path) -> int:
     config = load_config(state_dir)
-    changed = False
-
-    if args.set_enabled_runners is not None:
-        enabled = parse_runner_list(args.set_enabled_runners)
-        validate_installed(enabled, config)
-        config["enabled_runners"] = enabled
-        config["onboarded"] = bool(enabled)
-        if config.get("default_runner") not in enabled:
-            config["default_runner"] = None
-        changed = True
-
-    if args.set_default_runner is not None:
-        value = args.set_default_runner.strip().lower()
-        if value in ("ask", "none", "null", ""):
-            config["default_runner"] = None
-        else:
-            runner = canonical_runner(value)
-            validate_installed([runner], config)
-            enabled = list(config.get("enabled_runners", []))
-            if runner not in enabled:
-                enabled.append(runner)
-            config["enabled_runners"] = enabled
-            config["default_runner"] = runner
-            config["onboarded"] = True
-        changed = True
+    changed = any(
+        (
+            args.set_enabled_runners is not None,
+            args.set_default_runner is not None,
+            bool(args.set_bin),
+            bool(args.clear_bin),
+        )
+    )
 
     for assignment in args.set_bin or []:
         runner, raw_path = parse_bin_assignment(assignment)
@@ -389,7 +402,6 @@ def cmd_config(args: argparse.Namespace, state_dir: Path) -> int:
         paths = dict(config.get("runner_paths", {}))
         paths[runner] = str(path)
         config["runner_paths"] = paths
-        changed = True
 
     for runner_raw in args.clear_bin or []:
         runner = canonical_runner(runner_raw)
@@ -397,11 +409,18 @@ def cmd_config(args: argparse.Namespace, state_dir: Path) -> int:
         if runner in paths:
             del paths[runner]
             config["runner_paths"] = paths
-            changed = True
+
+    if args.set_enabled_runners is not None:
+        apply_enabled_runners(config, args.set_enabled_runners)
+    if args.set_default_runner is not None:
+        apply_default_runner(config, args.set_default_runner)
 
     if changed:
         save_config(state_dir, config)
-    print(json.dumps(onboarding_payload(state_dir, config), ensure_ascii=False, indent=2))
+        payload = onboarding_payload(state_dir, config)
+    else:
+        payload = config_view_payload(state_dir, config)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -557,6 +576,18 @@ def build_invocation(
     raise DelegateError(f"Unsupported runner: {runner}")
 
 
+def resume_command(runner: str, binary: str, session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    # Standard executable names stay short; custom paths are kept in full so the command still works.
+    name = Path(binary).name if Path(binary).name in RUNNER_BINARIES[runner] else binary
+    return shlex.join(part.format(bin=name, sid=session_id) for part in RESUME_TEMPLATES[runner])
+
+
+def emit(payload: dict[str, Any]) -> None:
+    print(json.dumps({"contract_version": CONTRACT_VERSION, **payload}, ensure_ascii=False, indent=2))
+
+
 def redact_command(command: list[str], prompt: str) -> list[str]:
     return ["<prompt>" if part == prompt else part for part in command]
 
@@ -697,7 +728,7 @@ def parse_runner_output(
                 if item.get("type") == "agent_message" and item.get("text"):
                     messages.append(str(item["text"]))
             elif event_type in ("turn.failed", "error"):
-                error = error_message(event.get("error") or event.get("message"))
+                error = error_message(event.get("error") or event.get("message")) or "Codex turn failed"
         response = messages[-1] if messages else ""
         protocol_ok = bool(session_id and (messages or error))
 
@@ -744,13 +775,26 @@ def parse_runner_output(
                 error = "DSH stream ended without a final event"
         protocol_ok = bool(session_id and final and not error)
 
-    status = "completed" if exit_code == 0 and protocol_ok and not error and session_id else "failed"
+    status = (
+        "completed"
+        if exit_code == 0 and protocol_ok and not error and session_id and response.strip()
+        else "failed"
+    )
     if status == "failed":
+        if not error:
+            if not protocol_ok:
+                error = "Runner returned an invalid or incomplete response"
+            elif not session_id:
+                error = "Runner did not return a session ID"
+            elif not response.strip():
+                error = "Runner returned an empty response"
+            elif exit_code != 0:
+                error = f"Runner exited with code {exit_code}"
+            else:
+                error = "Runner failed"
         stderr_detail = raw_err.strip()[-2000:]
         if stderr_detail and (not error or error not in stderr_detail):
             error = f"{error}\n{stderr_detail}" if error else stderr_detail
-        elif not error:
-            error = f"Runner exited with code {exit_code}"
     return {
         "status": status,
         "session_id": session_id,
@@ -814,7 +858,7 @@ def execute_run(args: argparse.Namespace, state_dir: Path, config: dict[str, Any
             "stdin": stdin_input is not None,
             "environment_overrides": env_updates,
         }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        emit(payload)
         return 0
 
     run_id = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:10]}"
@@ -822,7 +866,6 @@ def execute_run(args: argparse.Namespace, state_dir: Path, config: dict[str, Any
     run_dir.mkdir(parents=True, exist_ok=False)
     paths = {
         "prompt": run_dir / "prompt.txt",
-        "stdout": run_dir / "raw_stdout.txt",
         "stderr": run_dir / "stderr.log",
         "events": run_dir / "events.jsonl",
         "output": run_dir / "output.md",
@@ -870,7 +913,6 @@ def execute_run(args: argparse.Namespace, state_dir: Path, config: dict[str, Any
 
     raw_out = raw_out or ""
     raw_err = raw_err or ""
-    paths["stdout"].write_text(raw_out, encoding="utf-8")
     paths["stderr"].write_text(raw_err, encoding="utf-8")
     paths["events"].write_text(raw_out, encoding="utf-8")
     parsed = parse_runner_output(runner, raw_out, raw_err, exit_code, args.session)
@@ -887,12 +929,13 @@ def execute_run(args: argparse.Namespace, state_dir: Path, config: dict[str, Any
         "runner": runner,
         "workspace": str(workspace),
         "mode": args.mode,
+        "resume_command": resume_command(runner, binary_info["path"], parsed["session_id"]),
         "command": safe_command,
         "environment_overrides": env_updates,
         "output_path": str(paths["output"]),
         "result_path": str(paths["result"]),
         "events_path": str(paths["events"]),
-        "raw_stdout_path": str(paths["stdout"]),
+        "raw_stdout_path": str(paths["events"]),
         "stderr_path": str(paths["stderr"]),
         "started_at": started_at,
         "finished_at": finished_at,
@@ -900,6 +943,13 @@ def execute_run(args: argparse.Namespace, state_dir: Path, config: dict[str, Any
     }
     atomic_write_json(paths["result"], result)
 
+    if parsed["status"] == "completed":
+        return_code = 0
+    else:
+        return_code = exit_code if 0 < exit_code < 256 else 1
+    if args.json:
+        emit(result)
+        return return_code
     print(f"status={parsed['status']}")
     print(f"session_id={parsed['session_id'] or ''}")
     print(f"runner={runner}")
@@ -907,9 +957,7 @@ def execute_run(args: argparse.Namespace, state_dir: Path, config: dict[str, Any
     print(f"result_path={paths['result']}")
     print(f"events_path={paths['events']}")
     print(f"elapsed={elapsed:.1f}s")
-    if parsed["status"] != "completed":
-        return exit_code if 0 < exit_code < 256 else 1
-    return 0
+    return return_code
 
 
 def cmd_run(args: argparse.Namespace, state_dir: Path) -> int:
@@ -919,17 +967,20 @@ def cmd_run(args: argparse.Namespace, state_dir: Path) -> int:
         payload["how_to_onboard"] = (
             "delegate.py onboard --enable <runners> --default-runner <runner|ask>"
         )
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        emit(payload)
         return EXIT_NEEDS_ONBOARDING
 
     if not args.runner and not config.get("default_runner"):
         payload = {
             "status": "NEEDS_RUNNER_CHOICE",
             "enabled_runners": config.get("enabled_runners", []),
-            "detected_runners": scan_runners(config),
+            "available_runners": {
+                runner: detect_binary(runner, config)
+                for runner in config.get("enabled_runners", [])
+            },
             "message": "Choose a runner for this task or configure a default runner.",
         }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        emit(payload)
         return EXIT_NEEDS_RUNNER_CHOICE
 
     if not args.runner:
@@ -962,6 +1013,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--session")
     run.add_argument("--timeout", type=int, default=DEFAULT_RUN_TIMEOUT)
     run.add_argument("--dry-run", action="store_true")
+    run.add_argument(
+        "--json",
+        action="store_true",
+        help="Print one JSON object (result, status payload or error) instead of key=value lines",
+    )
     return parser
 
 
@@ -978,7 +1034,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_run(args, state_dir)
         raise DelegateError(f"Unknown command: {args.command}")
     except DelegateError as exc:
-        sys.stderr.write(f"[ERROR] {exc}\n")
+        if getattr(args, "json", False):
+            emit({"status": "ERROR", "error": str(exc)})
+        else:
+            sys.stderr.write(f"[ERROR] {exc}\n")
         return 1
 
 
