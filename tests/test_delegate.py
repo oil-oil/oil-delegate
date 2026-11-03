@@ -439,6 +439,23 @@ class DelegateTestCase(unittest.TestCase):
                 self.assertEqual(record["dsh_mode"], expected)
                 self.assertNotIn("--permission-mode", record["argv"])
 
+    def test_prompt_does_not_forbid_git_operations(self) -> None:
+        self.onboard_all()
+        record_path = self.root / "record.json"
+        proc = self.run_task(
+            "claude",
+            mode="write",
+            extra_env={"FAKE_RECORD": str(record_path)},
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        record = self.record_of()
+        prompt = record["stdin"] + " ".join(record["argv"])
+        self.assertNotIn("Do not run git add", prompt)
+        self.assertNotIn("git commit", prompt)
+        self.assertNotIn("git push", prompt)
+        self.assertNotIn("publish", prompt)
+        self.assertIn("Final report", prompt)
+
     def test_dry_run_has_no_process_or_run_artifacts(self) -> None:
         self.onboard_all()
         record_path = self.root / "record.json"
