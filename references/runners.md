@@ -5,6 +5,7 @@
 ## 目录导航
 
 - [共同约束](#共同约束)
+- [会话发现约束](#会话发现约束)
 - [Claude Code](#claude-code)
 - [WorkBuddy](#workbuddy)
 - [Antigravity](#antigravity)
@@ -17,13 +18,28 @@
 
 ## 共同约束
 
-正式 Runner 名为 `claude`、`workbuddy`、`antigravity`、`codex`、`opencode`、`dsh`、`grok`、`kimi`。别名包括 `cc/claude-code`、`wb/codebuddy/cbc`、`agy`、`deepseek/deepseek-harness`、`grok-build`、`kimi-code`。名称不区分大小写；启用、默认 Runner、单次委托和二进制路径配置都使用同一套别名解析，保存时统一转为正式 Runner 名。
+正式 Runner 名为 `claude`、`workbuddy`、`antigravity`、`codex`、`opencode`、`dsh`、`grok`、`kimi`。别名包括 `cc/claude-code`、`wb/codebuddy/cbc`、`agy/anti`、`deepseek/deepseek-harness`、`grok-build`、`kimi-code`。名称不区分大小写；启用、默认 Runner、单次委托、会话搜索和二进制路径配置都使用同一套别名解析，保存时统一转为正式 Runner 名。
 
 优先级：环境变量 `OIL_DELEGATE_<RUNNER>_BIN` → 配置中的 runner path → PATH → 已知安装目录。所有调用使用 argv 数组，prompt 不经过 shell。常规调用不指定模型、provider 或思考强度。
 
 省略 `--mode` 时默认 `write`，使用各 CLI 的最高可用权限，尽量避免无人值守任务停在常规审批。只有用户明确要求只读、plan 或限制权限时才使用 `read`。权限参数只影响当前进程，不修改目标 CLI 的永久配置。
 
 最高权限不等于安全隔离，也不保证所有操作一定成功：静态 deny、hooks、管理锁、登录、额度和网络仍可能失败。调用方仍需限定任务范围、检查改动并重跑测试。
+
+## 会话发现约束
+
+`sessions [--runner <名称或别名>] [--query <标题关键词>] [--limit N] [--json]` 独立于启用池和默认 runner。只读取标题、ID、目录和更新时间，不启动任务、不调用模型、不联网。搜索不区分大小写，完全相等的标题优先，其余按更新时间倒序；全局限制默认 20。`source` 区分 `official` 与 `local-store`，后者属于产品内部格式，升级后可能变化。
+
+| 数据根目录 | 默认值 | 环境变量覆盖 |
+| --- | --- | --- |
+| Kimi Code | `~/.kimi-code` | 官方 `KIMI_CODE_HOME`，传给列表子进程 |
+| Codex | `~/.codex` | 官方 `CODEX_HOME` |
+| Antigravity CLI | `~/.gemini/antigravity-cli` | `OIL_DELEGATE_ANTIGRAVITY_CLI_HOME` |
+| Antigravity | `~/.gemini/antigravity` | `OIL_DELEGATE_ANTIGRAVITY_HOME` |
+
+仅在这些本地根目录内读取，拒绝经过符号链接、云目录或挂载视图；遍历时跳过符号链接目录与文件。不扫描工作目录本身。缺失的本地索引/数据库返回空列表；缺少官方 CLI 或来源读取失败写入 `errors[runner]`。某个 Antigravity 数据库失败仍保留另一个数据库的结果。无法可靠发现的 runner 列入 `unsupported`，不会尝试读取对话文件来猜标题。
+
+单行元数据无效时跳过该行，保留同一来源中的其他会话，不写入 `errors`；缺失、非字符串或空字符串 ID 均无效。`title: null` 或缺失标题统一为空字符串，保留会话，有非空 `--query` 时自然不匹配。JSON 的 `skipped` 按 runner 统计筛选和限量之前跳过的坏行数，无坏行时为 `{}`；去重、未匹配标题和超出限量的会话不计入跳过数。
 
 ## Claude Code
 
@@ -33,6 +49,7 @@
 - write：`--dangerously-skip-permissions`。
 - 解析：最终 JSON 的 `session_id`、`result`、`is_error`。
 - 认证：先用官方交互式 CLI 完成安装与登录；不要在包装器中输入或转存密钥。
+- 会话发现：`unsupported`。本机 2.1.314 没有官方历史会话列表子命令；自定义标题与 AI 标题分别以 `custom-title` / `customTitle`、`ai-title` / `aiTitle` 记录混存于 Claude Code 数据目录下的 `projects/<项目>/<会话>.jsonl`。另有 `<会话>/custom-title.json` sidecar，实测只含 `customTitle`，不能覆盖完整标题与目录元数据；本机未发现独立的 `sessions-index.json`。无法确认完整、及时的独立标题索引，因此不扫描对话 JSONL，也不以首条 prompt 或摘要代替标题。稳定性：暂未接入，不能依赖旧版索引格式。
 
 官方参考：[Claude Code CLI usage](https://docs.anthropic.com/en/docs/claude-code/cli-usage)。
 
@@ -45,17 +62,20 @@
 - 进程环境：所有模式设置 `CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS=1`，避免 single-shot 模式不支持的后台任务。
 - 解析：与 Claude 兼容的最终 JSON 字段。
 - 认证：复用 WorkBuddy/CodeBuddy 已有登录。GUI 自动化不是后备方案。
+- 会话发现：`unsupported`。本机帮助中的 `ps` 仅列活动会话，未确认覆盖已结束历史会话的纯标题列表接口。稳定性：未接入，不猜测 Claude 兼容存储格式。
 
 官方参考：[WorkBuddy Headless Mode](https://www.workbuddy.ai/docs/cli/headless)。
 
 ## Antigravity
 
-- 发现：`agy`，Runner 名为 `antigravity`。
+- 发现：`agy`，Runner 名为 `antigravity`，接受 `agy`、`anti`。
 - 新建：`agy -p <prompt> --output-format json`；续接增加 `--conversation <conversation_id>`。
 - read：`--mode plan`。
 - write：`--dangerously-skip-permissions`。
 - 解析：`conversation_id`、`response`、`status`；只有 `SUCCESS` 可视为协议成功。
 - 认证：headless 使用缓存凭据，需先通过官方交互式 `agy` 完成认证；未认证时应报错而不是等待输入。
+- 会话发现：`local-store`。读取上述两个根目录中的 `conversation_summaries.db`，只查询 `conversation_summaries` 表的 `conversation_id`、`title`、`workspace_uris`、`last_modified_time`；将 JSON 列表中首个本机 `file://` URI 解码为目录。同 ID 跨库重复时保留更新时间较新的元数据。
+- 稳定性：内部 SQLite 格式。以 `file:<path>?immutable=1` URI 打开，不创建锁或 sidecar；只读已 checkpoint 的主库快照，WAL 中尚未 checkpoint 的新增/改名可能暂不可见，不执行 checkpoint。时间兼容 ISO 8601 与 Unix 秒/毫秒。
 
 官方参考：[Antigravity Headless Mode](https://antigravity.google/docs/cli/headless/)。
 
@@ -68,6 +88,9 @@
 - 续接：`codex exec resume --json ... <thread_id> -`，read 续接保留只读沙箱，write 续接使用最高权限。
 - 解析：JSONL 中的 `thread.started`、`item.completed` agent message、`turn.failed` 和 `error`。
 - 认证：沿用 Codex CLI 默认配置与登录，不复制其他目录的 provider 设置。
+- 会话发现：`local-store`。逐行读取 `$CODEX_HOME/session_index.jsonl` 的 `id`、`thread_name`、`updated_at`；跳过坏行后，同 ID 以文件中最后一条有效记录为准，先去重再匹配标题。只为过滤、排序和限制后返回的会话定位 `sessions/**/rollout-*-<id>.jsonl`，只解析第一行 `session_meta.payload.cwd`；找不到 rollout 时目录为 `null`。
+- 稳定性：内部追加式索引，可能随版本变化；不从对话正文恢复缺失标题，也不读取归档或其他数据根目录。
+- 已知限制：不读取或解压 `archived_sessions` 中的 `.jsonl.zst`；已归档或会话文件已删除的会话仍可由索引发现，其 `workspace` 为 `null`。
 
 官方参考：[Codex CLI](https://github.com/openai/codex)。
 
@@ -79,6 +102,7 @@
 - write：进程级权限允许 edit、bash 和 external_directory；question 仍拒绝，避免无交互任务等待用户。该方式不依赖新版才有的 `--auto`，同时适用于 1.3.9。
 - 解析：事件及其 `part` 中的 `sessionID/sessionId/session_id`；连接 text 事件的 `part.text`，读取 error 事件。
 - 认证：使用 `opencode auth login` 或其现有 provider 配置；包装器不读取认证文件。
+- 会话发现：`unsupported`。本机未安装可供离线核实的 OpenCode CLI，未验证官方列表命令的版本、参数和元数据字段。稳定性：未接入；不猜测命令或本地数据库格式。
 
 官方参考：[OpenCode CLI](https://opencode.ai/docs/cli/) 与 [Permissions](https://opencode.ai/docs/permissions/)。
 
@@ -92,6 +116,7 @@
 - 解析：开头 `session.sessionId`，结尾 `final.text` 与可用的 `final.reason`，以及 `error`。部分版本把终止原因放在 `status` 的 `turn_end` 中且让 final 省略 reason，解析器同时兼容；已知 reason 不是 completed 时即使进程退出 0 也判为失败。
 - 续接限制：保持原 cwd，并尊重 DSH 对 cwd、ownership 和 preset 的校验；不得把拒绝错误绕过为新空会话。
 - 认证：headless 的凭据链由实际 DSH profile 决定。包装器不读取 `.env`，也不假设 GUI 登录一定可用于 headless；根据真实错误引导用户使用官方配置。
+- 会话发现：`unsupported`。本机 launcher 与 headless 参数中未发现独立历史列表命令；内部 session-query 服务不视为稳定的官方 CLI。稳定性：未接入，不加载 profile 或访问对话存储来获取标题。
 
 官方参考：[DSH Headless](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/bundle/headless/README.md)。
 
@@ -103,6 +128,7 @@
 - write：`--always-approve`，自动批准编辑和命令；deny rules、hooks 和 admin locks 仍然有效。
 - 解析：最终 JSON 的 `sessionId`、`text`、`stopReason`；错误对象使用 `type/message`。
 - 认证：复用 Grok 已有登录；无浏览器环境由用户通过官方 device-auth 或 XAI 凭据链路另行配置。
+- 会话发现：`unsupported`。本机 1.0.13 有 `grok sessions list/search`，但帮助中无 JSON 元数据出口；`search` 明确搜索 summaries 和 first prompts，不能等同于仅按标题搜索。尚未确认完整、纯元数据的稳定列表格式，因此不解析展示文本或读取 transcript。稳定性：未接入，等待可验证的元数据接口。
 
 官方参考：[Grok Build Headless Mode](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md)。
 
@@ -114,6 +140,8 @@
 - read：不支持。非交互模式自带 auto 权限，无法保证只读；收到 read 请求时明确拒绝，不伪装成 plan。
 - 解析：assistant 的文本 content 和 `session.resume_hint.session_id`；同时兼容事件中的 session 字段与 error。
 - 认证：复用 Kimi Code 已有登录；静态 deny 规则仍然有效，登录由官方 CLI 另行完成。
+- 会话发现：`official`。调用 `kimi session list --all --json`，只取 `id`、`title`、`workDir`、`updatedAt`（毫秒时间戳字符串）；在包装器中统一筛选标题、排序和限制。官方数据目录覆盖变量是 `KIMI_CODE_HOME`，仍支持统一的二进制路径覆盖。不使用 `show/export` 或模型调用。
+- 稳定性：优先依赖官方 JSON 列表，整体列表无法解析或命令失败计入 `errors.kimi`；单行无效仅计入 `skipped.kimi`，不回退到内部数据库或对话记录。
 
 官方参考：[Kimi Command](https://www.kimi.com/code/docs/en/kimi-code-cli/reference/kimi-command.html)。
 

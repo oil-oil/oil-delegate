@@ -3,12 +3,15 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "delegate.py"
 SPEC = importlib.util.spec_from_file_location("delegate_under_test", SCRIPT_PATH)
@@ -35,6 +38,20 @@ if runner == "dsh" and "--help" in args:
         print("--json --session-id")
     else:
         print("--json --session-id --permission-mode --approval-policy")
+    raise SystemExit(0)
+if runner == "kimi" and args == ["session", "list", "--all", "--json"]:
+    if os.environ.get("FAKE_KIMI_EXIT"):
+        sys.stderr.write("cannot list kimi sessions\n")
+        raise SystemExit(int(os.environ["FAKE_KIMI_EXIT"]))
+    if os.environ.get("FAKE_RECORD"):
+        with open(os.environ["FAKE_RECORD"], "w", encoding="utf-8") as handle:
+            json.dump({{"argv": args, "kimi_home": os.environ.get("KIMI_CODE_HOME")}}, handle)
+    fixture = os.environ.get("FAKE_KIMI_SESSIONS")
+    if fixture:
+        with open(fixture, encoding="utf-8") as handle:
+            sys.stdout.write(handle.read())
+    else:
+        print("[]")
     raise SystemExit(0)
 
 stdin_text = sys.stdin.read()
@@ -140,6 +157,12 @@ class DelegateTestCase(unittest.TestCase):
     def base_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["OIL_DELEGATE_HOME"] = str(self.state_dir)
+        # Every data root points into the fixture, including official CLI subprocesses.
+        env["HOME"] = str(self.root / "home")
+        env["CODEX_HOME"] = str(self.root / "codex-home")
+        env["KIMI_CODE_HOME"] = str(self.root / "kimi-home")
+        env["OIL_DELEGATE_ANTIGRAVITY_CLI_HOME"] = str(self.root / "anti-cli-home")
+        env["OIL_DELEGATE_ANTIGRAVITY_HOME"] = str(self.root / "anti-home")
         for key in list(env):
             if key.startswith("FAKE_"):
                 env.pop(key, None)
@@ -297,10 +320,11 @@ class DelegateTestCase(unittest.TestCase):
         self.assertEqual(payload["default_runner"], "claude")
         self.assertIn("cc", payload["detected_runners"]["claude"]["aliases"])
         self.assertIn("wb", payload["detected_runners"]["workbuddy"]["aliases"])
+        self.assertIn("anti", payload["detected_runners"]["antigravity"]["aliases"])
         self.assertIn("grok-build", payload["detected_runners"]["grok"]["aliases"])
         self.assertIn("kimi-code", payload["detected_runners"]["kimi"]["aliases"])
 
-        for alias, canonical in (("wb", "workbuddy"), ("kimi-code", "kimi")):
+        for alias, canonical in (("wb", "workbuddy"), ("kimi-code", "kimi"), ("anti", "antigravity")):
             with self.subTest(alias=alias):
                 proc = self.run_task(alias, mode="write")
                 self.assertEqual(proc.returncode, 0, msg=proc.stderr)
@@ -720,6 +744,354 @@ class DelegateTestCase(unittest.TestCase):
         self.assertEqual(result["events_path"], result["raw_stdout_path"])
         self.assertTrue(Path(result["events_path"]).is_file())
         self.assertNotIn("run_timeout_seconds", DELEGATE.default_config())
+
+    def write_codex_index(self, rows: list[dict]) -> Path:
+        path = self.root / "codex-home" / "session_index.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        return path
+
+    def write_rollout(self, sid: str, cwd: str) -> Path:
+        path = self.root / "codex-home" / "sessions" / "2026" / "11" / "03" / f"rollout-2026-11-03-{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        header = {"type": "session_meta", "payload": {"id": sid, "cwd": cwd}}
+        # Invalid UTF-8 and JSON after the header must never be decoded or parsed.
+        path.write_bytes(json.dumps(header).encode() + b"\n\xffnot conversation metadata\n")
+        return path
+
+    def write_anti_db(self, dirname: str, rows: list[tuple], *, wal: bool = False) -> sqlite3.Connection:
+        path = self.root / dirname / "conversation_summaries.db"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path)
+        if wal:
+            connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT, title TEXT, "
+            "workspace_uris TEXT, last_modified_time, body TEXT DEFAULT 'private')"
+        )
+        connection.executemany("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?, 'private')", rows)
+        connection.commit()
+        if wal:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return connection
+
+    def sessions_payload(self, *args: str, extra_env: dict[str, str] | None = None) -> dict:
+        proc = self.run_cli("sessions", *args, "--json", extra_env=extra_env)
+        self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["contract_version"], 1)
+        self.assertEqual(payload["status"], "OK")
+        self.assertIsInstance(payload["skipped"], dict)
+        return payload
+
+    def test_sessions_kimi_official_list_and_root_override_without_onboarding(self) -> None:
+        fixture = self.root / "kimi-sessions.json"
+        fixture.write_text(json.dumps([
+            {"id": "kimi-1", "title": "项目 Plan", "workDir": "/fixture/project", "updatedAt": "1793664000123"},
+            {"id": "kimi-2", "title": "Unrelated", "workDir": "/fixture/other", "updatedAt": "1793665000123",
+             "firstPrompt": "项目 Plan"},
+        ]))
+        log = self.root / "calls.jsonl"
+        record = self.root / "record.json"
+        payload = self.sessions_payload("--runner", "kimi-code", "--query", "项目 pLAN", extra_env={
+            "FAKE_KIMI_SESSIONS": str(fixture), "FAKE_CALL_LOG": str(log), "FAKE_RECORD": str(record),
+        })
+        row, = payload["sessions"]
+        self.assertEqual(set(row), {"runner", "session_id", "title", "workspace", "updated_at", "resume_command", "source"})
+        self.assertEqual((row["runner"], row["session_id"], row["title"], row["workspace"], row["source"]),
+                         ("kimi", "kimi-1", "项目 Plan", "/fixture/project", "official"))
+        self.assertEqual(row["updated_at"], "2026-11-03T00:00:00.123000+00:00")
+        self.assertEqual(shlex.split(row["resume_command"])[1:], ["-S", "kimi-1"])
+        self.assertEqual(json.loads(log.read_text())["argv"], ["session", "list", "--all", "--json"])
+        self.assertEqual(self.record_of()["kimi_home"], str(self.root / "kimi-home"))
+        self.assertEqual((payload["unsupported"], payload["errors"]), ([], {}))
+        self.assertEqual(payload["skipped"], {})
+        self.assertFalse(self.state_dir.exists())
+
+    def test_sessions_kimi_null_titles_and_bad_rows_keep_valid_sessions(self) -> None:
+        bad_rows = [
+            None,
+            [],
+            {"title": "Missing ID"},
+            {"id": None, "title": "Null ID"},
+            {"id": 42, "title": "Numeric ID"},
+            {"id": "", "title": "Empty ID"},
+            {"id": "bad-title", "title": False},
+            {"id": "bad-time", "title": "Invalid time", "updatedAt": "invalid"},
+            {"id": "bad-cwd", "title": "Invalid workspace", "workDir": []},
+        ]
+        fixture = self.root / "kimi-mixed.json"
+        fixture.write_text(json.dumps([
+            bad_rows[0],
+            {"id": "named", "title": "Topic", "workDir": "/fixture/kimi", "updatedAt": "1793664000000"},
+            {"id": "unnamed", "title": None, "updatedAt": "1793665000000"},
+            *bad_rows[1:],
+            {"id": "missing-title"},
+        ]))
+        env = {"FAKE_KIMI_SESSIONS": str(fixture)}
+        payload = self.sessions_payload("--runner", "kimi", extra_env=env)
+        rows = {row["session_id"]: row for row in payload["sessions"]}
+        self.assertEqual(set(rows), {"named", "unnamed", "missing-title"})
+        self.assertEqual(rows["unnamed"]["title"], "")
+        self.assertEqual(rows["missing-title"]["title"], "")
+        self.assertEqual(payload["errors"], {})
+        self.assertEqual(payload["skipped"], {"kimi": len(bad_rows)})
+        filtered = self.sessions_payload("--runner", "kimi", "--query", "topic", "--limit", "1", extra_env=env)
+        self.assertEqual([row["session_id"] for row in filtered["sessions"]], ["named"])
+        self.assertEqual(filtered["errors"], {})
+        self.assertEqual(filtered["skipped"], payload["skipped"])
+
+    def test_sessions_codex_renames_use_last_line_and_read_only_matching_headers(self) -> None:
+        self.write_codex_index([
+            {"id": "same-id", "thread_name": "Old title", "updated_at": "2026-11-03T12:00:00Z"},
+            {"id": "other-id", "thread_name": "Unrelated", "updated_at": "2026-11-03T13:00:00Z"},
+            # The last row wins even with an older timestamp.
+            {"id": "same-id", "thread_name": "New title", "updated_at": "2026-11-03T11:00:00Z"},
+        ])
+        rollout = self.write_rollout("same-id", "/fixture/codex")
+        unrelated = self.write_rollout("other-id", "/fixture/unrelated")
+        unrelated.write_bytes(b"invalid header, must not be opened")
+        before = rollout.read_bytes()
+        payload = self.sessions_payload("--runner", "codex", "--query", "NEW TITLE")
+        row, = payload["sessions"]
+        self.assertEqual((row["session_id"], row["title"], row["workspace"], row["source"]),
+                         ("same-id", "New title", "/fixture/codex", "local-store"))
+        self.assertEqual(payload["errors"], {})
+        self.assertEqual(shlex.split(row["resume_command"])[1:], ["resume", "same-id"])
+        self.assertEqual(self.sessions_payload("--runner", "codex", "--query", "Old title")["sessions"], [])
+        self.assertEqual(rollout.read_bytes(), before)
+
+    def test_sessions_codex_hydrates_only_returned_results_after_limit(self) -> None:
+        self.write_codex_index([
+            {"id": "first", "thread_name": "Topic", "updated_at": "2026-11-03T12:00:00Z"},
+            {"id": "second", "thread_name": "Topic", "updated_at": "2026-11-03T11:00:00Z"},
+        ])
+        self.write_rollout("first", "/fixture/first")
+        self.write_rollout("second", "unused").write_bytes(b"unread invalid header")
+        payload = self.sessions_payload("--runner", "codex", "--limit", "1")
+        self.assertEqual([row["session_id"] for row in payload["sessions"]], ["first"])
+        self.assertEqual(payload["errors"], {})
+
+    def test_sessions_codex_bad_index_rows_do_not_discard_valid_rows(self) -> None:
+        path = self.write_codex_index([
+            {"id": "renamed", "thread_name": "Old title", "updated_at": None},
+            None,
+            [],
+            {"thread_name": "Missing ID"},
+            {"id": None, "thread_name": "Null ID"},
+            {"id": 42, "thread_name": "Numeric ID"},
+            {"id": "", "thread_name": "Empty ID"},
+            {"id": "bad-title", "thread_name": []},
+            {"id": "bad-time", "thread_name": "Invalid time", "updated_at": "invalid"},
+        ])
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write("invalid JSON\n\n")
+            handle.write(json.dumps({"id": "renamed", "thread_name": "New title", "updated_at": None}) + "\n")
+            handle.write(json.dumps({"id": "unnamed", "thread_name": None, "updated_at": None}) + "\n")
+        payload = self.sessions_payload("--runner", "codex")
+        self.assertEqual({row["session_id"]: row["title"] for row in payload["sessions"]},
+                         {"renamed": "New title", "unnamed": ""})
+        self.assertEqual(payload["errors"], {})
+        self.assertEqual(payload["skipped"], {"codex": 9})
+
+    def test_sessions_codex_without_rollout_keeps_metadata(self) -> None:
+        self.write_codex_index([{"id": "missing", "thread_name": "Indexed", "updated_at": None}])
+        row, = self.sessions_payload("--runner", "codex")["sessions"]
+        self.assertIsNone(row["workspace"])
+        self.assertIsNone(row["updated_at"])
+
+    def test_sessions_codex_archived_or_deleted_rollouts_have_null_workspace(self) -> None:
+        self.write_codex_index([
+            {"id": sid, "thread_name": sid, "updated_at": None}
+            for sid in ("active", "archived", "deleted")
+        ])
+        self.write_rollout("active", "/fixture/active")
+        self.write_rollout("deleted", "/fixture/deleted").unlink()
+        archive = self.root / "codex-home" / "archived_sessions" / "rollout-any-archived.jsonl.zst"
+        archive.parent.mkdir()
+        archive.write_bytes(b"archive must not be opened or decompressed")
+        payload = self.sessions_payload("--runner", "codex")
+        self.assertEqual({row["session_id"]: row["workspace"] for row in payload["sessions"]},
+                         {"active": "/fixture/active", "archived": None, "deleted": None})
+        self.assertEqual((payload["errors"], payload["skipped"]), ({}, {}))
+
+    def test_sessions_preserves_submillisecond_order_and_default_local_root(self) -> None:
+        path = self.write_codex_index([
+            {"id": "a-older", "thread_name": "Topic", "updated_at": "2026-11-03T12:00:00.000001Z"},
+            {"id": "z-newer", "thread_name": "Topic", "updated_at": "2026-11-03T12:00:00.000002Z"},
+        ])
+        default_root = self.root / "home" / ".codex"
+        default_root.mkdir(parents=True)
+        path.replace(default_root / path.name)
+        proc = self.run_cli("sessions", "--runner", "codex", "--json", remove_env=["CODEX_HOME"])
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertEqual([row["session_id"] for row in json.loads(proc.stdout)["sessions"]], ["z-newer", "a-older"])
+
+    def test_sessions_antigravity_both_roots_dedup_uri_and_anti_alias(self) -> None:
+        for dirname, rows in (
+            ("anti-cli-home", [("shared", "Old", '["file:///fixture/old"]', "2026-11-03T01:00:00Z")]),
+            ("anti-home", [("shared", "New", '["https://example.invalid", "file://localhost/fixture/a%20b"]',
+                            "2026-11-03T03:00:00+01:00"),
+                           ("unique", "Extra", '[]', 1793664000000)]),
+        ):
+            self.write_anti_db(dirname, rows).close()
+        payload = self.sessions_payload("--runner", "ANTI")
+        self.assertEqual(payload["unsupported"], [])
+        self.assertEqual(payload["errors"], {})
+        self.assertEqual([row["session_id"] for row in payload["sessions"]], ["shared", "unique"])
+        row = payload["sessions"][0]
+        self.assertEqual((row["runner"], row["title"], row["workspace"], row["updated_at"], row["source"]),
+                         ("antigravity", "New", "/fixture/a b", "2026-11-03T02:00:00.000000+00:00", "local-store"))
+        self.assertEqual(shlex.split(row["resume_command"])[1:], ["--conversation", "shared"])
+
+    def test_sessions_antigravity_uses_immutable_snapshot_without_writes(self) -> None:
+        connection = self.write_anti_db("anti cli ?#", [("checkpointed", "Saved", '[]', 1793664000)], wal=True)
+        self.addCleanup(connection.close)
+        connection.execute("INSERT INTO conversation_summaries VALUES ('wal-only', 'Recent', '[]', 1793665000, 'private')")
+        connection.commit()
+        root = self.root / "anti cli ?#"
+        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()}
+        connect = sqlite3.connect
+        uris = []
+
+        def immutable_connect(database: str, **kwargs):
+            uris.append((database, kwargs))
+            conn = connect(database, **kwargs)
+            # Any attempt to select the body column violates the metadata-only contract.
+            conn.set_authorizer(lambda op, table, column, *_:
+                                sqlite3.SQLITE_DENY if op == sqlite3.SQLITE_READ and column == "body"
+                                else sqlite3.SQLITE_OK)
+            return conn
+
+        with mock.patch.dict(os.environ, {**self.base_env(), "OIL_DELEGATE_ANTIGRAVITY_CLI_HOME": str(root)}, clear=True), \
+                mock.patch.object(DELEGATE.sqlite3, "connect", side_effect=immutable_connect):
+            errors = {}
+            skipped = {}
+            rows = DELEGATE.antigravity_sessions(errors, skipped)
+        self.assertEqual(errors, {})
+        self.assertEqual(skipped, {})
+        self.assertEqual([row["session_id"] for row in rows], ["checkpointed"])
+        self.assertEqual(uris, [((root / "conversation_summaries.db").as_uri() + "?immutable=1", {"uri": True})])
+        self.assertEqual({p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.iterdir()}, before)
+
+    def test_sessions_antigravity_bad_rows_keep_valid_rows_from_both_databases(self) -> None:
+        self.write_anti_db("anti-cli-home", [
+            ("first", "First topic", '["file:///fixture/first"]', 1793664000),
+            (None, "Null ID", '[]', 1793664000),
+            ("", "Empty ID", '[]', 1793664000),
+            ("bad-json", "Invalid JSON", 'not JSON', 1793664000),
+            ("unnamed", None, '[]', 1793664000),
+        ]).close()
+        self.write_anti_db("anti-home", [
+            ("bad-list", "Invalid URI list", '{}', 1793664000),
+            ("bad-uri", "Invalid URI", '[42]', 1793664000),
+            ("bad-time", "Invalid time", '[]', 'invalid'),
+            ("last", "Last topic", '["file:///fixture/last"]', 1793665000),
+        ]).close()
+        payload = self.sessions_payload("--runner", "anti")
+        self.assertEqual({row["session_id"]: row["title"] for row in payload["sessions"]},
+                         {"first": "First topic", "last": "Last topic", "unnamed": ""})
+        self.assertEqual(payload["errors"], {})
+        self.assertEqual(payload["skipped"], {"antigravity": 6})
+
+    def test_sessions_one_antigravity_database_failure_keeps_other_database(self) -> None:
+        bad = self.root / "anti-cli-home" / "conversation_summaries.db"
+        bad.parent.mkdir()
+        bad.write_bytes(b"not a database")
+        self.write_anti_db("anti-home", [("valid", "Good", '[]', 1793664000)]).close()
+        payload = self.sessions_payload("--runner", "anti")
+        self.assertEqual([row["session_id"] for row in payload["sessions"]], ["valid"])
+        self.assertIn("antigravity-cli", payload["errors"]["antigravity"])
+
+    def test_sessions_source_failures_do_not_block_other_runners(self) -> None:
+        index = self.write_codex_index([])
+        index.unlink()
+        index.mkdir()  # An actual source read failure, distinct from a skippable bad row.
+        self.write_anti_db("anti-home", [("valid", "Good", '[]', 1793664000)]).close()
+        payload = self.sessions_payload(extra_env={"FAKE_KIMI_EXIT": "2"})
+        self.assertEqual([row["runner"] for row in payload["sessions"]], ["antigravity"])
+        self.assertEqual(set(payload["errors"]), {"codex", "kimi"})
+        self.assertIn("exited 2", payload["errors"]["kimi"])
+        self.assertEqual(payload["skipped"], {})
+        self.assertEqual(payload["unsupported"], ["claude", "workbuddy", "opencode", "dsh", "grok"])
+        self.assertFalse(self.state_dir.exists())
+
+    def test_sessions_exact_title_first_then_updated_at_across_runners(self) -> None:
+        self.write_codex_index([{"id": "exact-old", "thread_name": "Topic", "updated_at": "2026-11-01T00:00:00Z"}])
+        self.write_rollout("exact-old", "/fixture/codex")
+        self.write_anti_db("anti-cli-home", [("partial-new", "A Topic", '[]', "2026-11-03T12:00:00Z")]).close()
+        fixture = self.root / "kimi.json"
+        fixture.write_text(json.dumps([
+            {"id": "exact-new", "title": "TOPIC", "workDir": "/fixture/kimi", "updatedAt": "1793664000000"},
+            {"id": "partial-old", "title": "Topic extra", "workDir": None, "updatedAt": "1793577600000"},
+        ]))
+        payload = self.sessions_payload("--query", "topic", "--limit", "3", extra_env={"FAKE_KIMI_SESSIONS": str(fixture)})
+        self.assertEqual([row["session_id"] for row in payload["sessions"]], ["exact-new", "exact-old", "partial-new"])
+        self.assertEqual(payload["errors"], {})
+
+    def test_sessions_skips_symlinked_rollouts_and_directories(self) -> None:
+        self.write_codex_index([{"id": "linked", "thread_name": "Linked", "updated_at": None}])
+        external = self.root / "outside"
+        external.mkdir()
+        target = external / "rollout-any-linked.jsonl"
+        target.write_bytes(b"must not be read")
+        sessions = self.root / "codex-home" / "sessions"
+        sessions.mkdir()
+        (sessions / target.name).symlink_to(target)
+        (sessions / "linked-directory").symlink_to(external, target_is_directory=True)
+        payload = self.sessions_payload("--runner", "codex")
+        self.assertIsNone(payload["sessions"][0]["workspace"])
+        self.assertEqual(payload["errors"], {})
+
+    def test_sessions_rejects_cloud_and_symlink_roots_before_scanning(self) -> None:
+        real = self.root / "local"
+        real.mkdir()
+        symlink = self.root / "symlink"
+        symlink.symlink_to(real, target_is_directory=True)
+        for root in (symlink, self.root / "Library" / "CloudStorage" / "provider", self.root / "Screen Studio Archive"):
+            with self.subTest(root=root):
+                payload = self.sessions_payload("--runner", "codex", extra_env={"CODEX_HOME": str(root)})
+                self.assertEqual(payload["sessions"], [])
+                self.assertIn("codex", payload["errors"])
+
+    def test_sessions_invalid_kimi_list_reports_source_error(self) -> None:
+        fixture = self.root / "invalid-kimi.json"
+        for content in ("not JSON", '{"sessions": "bad"}'):
+            with self.subTest(content=content):
+                fixture.write_text(content)
+                payload = self.sessions_payload("--runner", "kimi", extra_env={"FAKE_KIMI_SESSIONS": str(fixture)})
+                self.assertEqual(payload["sessions"], [])
+                self.assertIn("kimi", payload["errors"])
+                self.assertEqual(payload["skipped"], {})
+
+    def test_sessions_missing_local_roots_are_empty(self) -> None:
+        for runner in ("codex", "anti"):
+            with self.subTest(runner=runner):
+                payload = self.sessions_payload("--runner", runner)
+                self.assertEqual((payload["sessions"], payload["errors"], payload["unsupported"]), ([], {}, []))
+
+    def test_sessions_unsupported_runner_does_not_start_cli(self) -> None:
+        log = self.root / "calls.jsonl"
+        for runner, canonical in (("cc", "claude"), ("wb", "workbuddy"), ("opencode", "opencode"),
+                                  ("dsh", "dsh"), ("grok-build", "grok")):
+            with self.subTest(runner=runner):
+                payload = self.sessions_payload("--runner", runner, extra_env={"FAKE_CALL_LOG": str(log)})
+                self.assertEqual((payload["sessions"], payload["errors"], payload["unsupported"]), ([], {}, [canonical]))
+        self.assertFalse(log.exists())
+
+    def test_sessions_invalid_runner_and_limit_use_json_error_contract(self) -> None:
+        for args in (("--runner", "unknown"), ("--limit", "0"), ("--limit", "-1")):
+            with self.subTest(args=args):
+                proc = self.run_cli("sessions", *args, "--json")
+                self.assertEqual(proc.returncode, 1)
+                payload = json.loads(proc.stdout)
+                self.assertEqual((payload["contract_version"], payload["status"]), (1, "ERROR"))
+
+    def test_sessions_plain_output_is_readable(self) -> None:
+        self.write_codex_index([{"id": "one", "thread_name": "Title", "updated_at": None}])
+        proc = self.run_cli("sessions", "--runner", "codex")
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertIn("codex\tone\tTitle\t", proc.stdout)
 
 
 if __name__ == "__main__":

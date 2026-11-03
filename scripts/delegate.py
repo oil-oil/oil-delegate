@@ -8,6 +8,7 @@ import os
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 if sys.version_info < (3, 10):
     sys.stderr.write("[ERROR] oil-delegate requires Python 3.10 or newer.\n")
@@ -34,7 +36,7 @@ SUPPORTED_RUNNERS = (
 RUNNER_LABELS = {
     "claude": "Claude Code (claude/cc)",
     "workbuddy": "WorkBuddy (codebuddy/cbc/wb)",
-    "antigravity": "Antigravity (agy)",
+    "antigravity": "Antigravity (agy/anti)",
     "codex": "Codex (codex)",
     "opencode": "OpenCode (opencode)",
     "dsh": "DeepSeek Harness (dsh)",
@@ -58,6 +60,7 @@ RUNNER_ALIASES = {
     "codebuddy": "workbuddy",
     "cbc": "workbuddy",
     "agy": "antigravity",
+    "anti": "antigravity",
     "deepseek": "dsh",
     "deepseek-harness": "dsh",
     "grok-build": "grok",
@@ -588,6 +591,256 @@ def emit(payload: dict[str, Any]) -> None:
     print(json.dumps({"contract_version": CONTRACT_VERSION, **payload}, ensure_ascii=False, indent=2))
 
 
+def session_root(env_key: str, default: Path) -> Path:
+    # Keep discovery inside explicit local roots; never resolve through a symlink.
+    root = Path(os.environ.get(env_key) or default).expanduser().absolute()
+    for path in (root, *root.parents):
+        if path.is_symlink() or path.name in {"iCloud Drive", "Screen Studio Archive"}:
+            raise DelegateError(f"Session root must be a local directory without symlinks: {root}")
+        if path.parent.name == "Library" and path.name in {"Mobile Documents", "CloudStorage"}:
+            raise DelegateError(f"Cloud session roots are excluded: {root}")
+        if path != Path(path.anchor) and path.is_mount():
+            raise DelegateError(f"Mounted session roots are excluded: {root}")
+    return root
+
+
+def session_timestamp(value: Any, *, milliseconds: bool = False) -> str | None:
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        stamp = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    else:
+        # Antigravity stores may use epoch seconds or milliseconds; Kimi is milliseconds.
+        if milliseconds or abs(numeric) >= 100_000_000_000:
+            numeric /= 1000
+        stamp = dt.datetime.fromtimestamp(numeric, dt.timezone.utc)
+    return stamp.astimezone(dt.timezone.utc).isoformat(timespec="microseconds")
+
+
+def session_summary(
+    runner: str, sid: Any, title: Any, workspace: Any, updated: Any, *, milliseconds: bool = False,
+) -> dict[str, Any]:
+    if title is None:
+        title = ""
+    if not isinstance(sid, str) or not sid or not isinstance(title, str):
+        raise DelegateError(f"Invalid {runner} session ID or title in metadata")
+    if workspace is not None and not isinstance(workspace, str):
+        raise DelegateError(f"Invalid {runner} workspace in metadata")
+    return {
+        "runner": runner,
+        "session_id": sid,
+        "title": title,
+        "workspace": workspace,
+        "updated_at": session_timestamp(updated, milliseconds=milliseconds),
+        "source": "official" if runner == "kimi" else "local-store",
+    }
+
+
+def kimi_sessions(config: dict[str, Any], skipped: dict[str, int]) -> list[dict[str, Any]]:
+    # KIMI_CODE_HOME is the official CLI's data-root override, inherited by the subprocess.
+    root = session_root("KIMI_CODE_HOME", Path.home() / ".kimi-code")
+    binary = detect_binary("kimi", config)
+    if not binary["installed"]:
+        raise DelegateError(binary["error"])
+    proc = subprocess.run(
+        [binary["path"], "session", "list", "--all", "--json"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15, check=False,
+        env={**os.environ, "KIMI_CODE_HOME": str(root)},
+    )
+    if proc.returncode:
+        raise DelegateError(f"kimi session list exited {proc.returncode}: {proc.stderr.strip()[:500]}")
+    rows = json.loads(proc.stdout)
+    if isinstance(rows, dict):
+        rows = rows.get("sessions")
+    if not isinstance(rows, list):
+        raise DelegateError("kimi session list did not return a JSON session list")
+    sessions = []
+    for row in rows:
+        try:
+            if not isinstance(row, dict):
+                raise DelegateError("Invalid Kimi session metadata row")
+            sessions.append(session_summary("kimi", row.get("id"), row.get("title"), row.get("workDir"),
+                                            row.get("updatedAt"), milliseconds=True))
+        except (DelegateError, ValueError, TypeError, OverflowError):
+            skipped["kimi"] = skipped.get("kimi", 0) + 1
+    return sessions
+
+
+def codex_sessions(skipped: dict[str, int]) -> list[dict[str, Any]]:
+    root = session_root("CODEX_HOME", Path.home() / ".codex")
+    index = root / "session_index.jsonl"
+    if index.is_symlink():
+        raise DelegateError(f"Symlinked session index is excluded: {index}")
+    try:
+        handle = index.open("r", encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    latest = {}
+    with handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise DelegateError("Invalid Codex session metadata row")
+                summary = session_summary("codex", row.get("id"), row.get("thread_name"),
+                                          None, row.get("updated_at"))
+            except (DelegateError, ValueError, TypeError, OverflowError):
+                skipped["codex"] = skipped.get("codex", 0) + 1
+                continue
+            # Renames append rows. The last valid row in file order is authoritative.
+            latest[summary["session_id"]] = summary
+    return list(latest.values())
+
+
+def codex_session_workspaces(sessions: list[dict[str, Any]]) -> None:
+    pending = {row["session_id"]: row for row in sessions if row["runner"] == "codex"}
+    if not pending:
+        return
+    root = session_root("CODEX_HOME", Path.home() / ".codex") / "sessions"
+    if root.is_symlink() or root.is_mount():
+        raise DelegateError(f"Symlinked or mounted sessions directory is excluded: {root}")
+    if not root.exists():
+        return
+
+    def walk_error(exc: OSError) -> None:
+        raise exc
+
+    for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
+        dirs[:] = sorted(
+            name for name in dirs
+            if name not in {"iCloud Drive", "Screen Studio Archive", "Mobile Documents", "CloudStorage"}
+            and not (Path(directory) / name).is_symlink()
+            and not (Path(directory) / name).is_mount()
+        )
+        for name in sorted(files):
+            if not name.startswith("rollout-") or not name.endswith(".jsonl"):
+                continue
+            sid = next((sid for sid in pending if name.endswith(f"-{sid}.jsonl")), None)
+            path = Path(directory) / name
+            if sid is None or path.is_symlink():
+                continue
+            # Binary readline avoids decoding (or parsing) any following conversation records.
+            with path.open("rb") as handle:
+                meta = json.loads(handle.readline())
+            payload = meta.get("payload", {})
+            if meta.get("type") != "session_meta" or payload.get("id", sid) != sid:
+                raise DelegateError(f"Invalid Codex session_meta header: {path}")
+            cwd = payload.get("cwd")
+            if cwd is not None and not isinstance(cwd, str):
+                raise DelegateError(f"Invalid Codex cwd in session_meta header: {path}")
+            pending.pop(sid)["workspace"] = cwd
+            if not pending:
+                return
+
+
+def antigravity_sessions(errors: dict[str, str], skipped: dict[str, int]) -> list[dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    failures = []
+    for env_key, dirname in (
+        ("OIL_DELEGATE_ANTIGRAVITY_CLI_HOME", "antigravity-cli"),
+        ("OIL_DELEGATE_ANTIGRAVITY_HOME", "antigravity"),
+    ):
+        try:
+            root = session_root(env_key, Path.home() / ".gemini" / dirname)
+            path = root / "conversation_summaries.db"
+            if path.is_symlink():
+                raise DelegateError(f"Symlinked session database is excluded: {path}")
+            if not path.exists():
+                continue
+            # immutable=1 opens the existing snapshot without creating locks, journals or sidecars.
+            connection = sqlite3.connect(path.as_uri() + "?immutable=1", uri=True)
+            try:
+                rows = connection.execute(
+                    "SELECT conversation_id, title, workspace_uris, last_modified_time "
+                    "FROM conversation_summaries"
+                )
+                for sid, title, workspace_uris, modified in rows:
+                    try:
+                        uris = json.loads(workspace_uris) if workspace_uris else []
+                        if not isinstance(uris, list) or any(not isinstance(uri, str) for uri in uris):
+                            raise DelegateError("Invalid Antigravity workspace_uris JSON list")
+                        workspace = None
+                        for uri in uris:
+                            parsed = urlparse(uri)
+                            if parsed.scheme == "file" and parsed.netloc in ("", "localhost"):
+                                workspace = unquote(parsed.path)
+                                break
+                        summary = session_summary("antigravity", sid, title, workspace, modified)
+                    except (DelegateError, ValueError, TypeError, OverflowError):
+                        skipped["antigravity"] = skipped.get("antigravity", 0) + 1
+                        continue
+                    if sid not in latest or (summary["updated_at"] or "") > (latest[sid]["updated_at"] or ""):
+                        latest[sid] = summary
+            finally:
+                connection.close()
+        except (DelegateError, OSError, ValueError, TypeError, OverflowError, sqlite3.Error) as exc:
+            failures.append(f"{dirname}: {exc}")
+    if failures:
+        errors["antigravity"] = "; ".join(failures)
+    return list(latest.values())
+
+
+def cmd_sessions(args: argparse.Namespace, state_dir: Path) -> int:
+    if args.limit < 1:
+        raise DelegateError("--limit must be a positive integer")
+    runners = [canonical_runner(args.runner)] if args.runner else list(SUPPORTED_RUNNERS)
+    config = load_config(state_dir)
+    sessions: list[dict[str, Any]] = []
+    unsupported = []
+    errors: dict[str, str] = {}
+    skipped: dict[str, int] = {}
+    for runner in runners:
+        try:
+            if runner == "kimi":
+                sessions.extend(kimi_sessions(config, skipped))
+            elif runner == "codex":
+                sessions.extend(codex_sessions(skipped))
+            elif runner == "antigravity":
+                sessions.extend(antigravity_sessions(errors, skipped))
+            else:
+                unsupported.append(runner)
+        except (DelegateError, OSError, ValueError, TypeError, AttributeError, OverflowError,
+                subprocess.SubprocessError) as exc:
+            errors[runner] = str(exc)
+    query = (args.query or "").casefold()
+    sessions = [row for row in sessions if query in row["title"].casefold()]
+    sessions.sort(key=lambda row: (row["runner"], row["session_id"]))
+    sessions.sort(
+        key=lambda row: (bool(query) and row["title"].casefold() == query, row["updated_at"] or ""),
+        reverse=True,
+    )
+    sessions = sessions[:args.limit]
+    try:
+        codex_session_workspaces(sessions)
+    except (DelegateError, OSError, ValueError, TypeError, AttributeError) as exc:
+        errors["codex"] = str(exc)
+    for row in sessions:
+        runner = row["runner"]
+        binary = detect_binary(runner, config)["path"] or RUNNER_BINARIES[runner][0]
+        row["resume_command"] = resume_command(runner, binary, row["session_id"])
+    payload = {"status": "OK", "sessions": sessions, "unsupported": unsupported, "errors": errors,
+               "skipped": skipped}
+    if args.json:
+        emit(payload)
+    else:
+        for row in sessions:
+            print(f"{row['runner']}\t{row['session_id']}\t{row['title']}\t"
+                  f"{row['workspace'] or ''}\t{row['updated_at'] or ''}")
+        if unsupported:
+            print(f"unsupported={','.join(unsupported)}")
+        for runner, count in skipped.items():
+            print(f"skipped.{runner}={count}")
+        for runner, message in errors.items():
+            sys.stderr.write(f"[ERROR] {runner}: {message}\n")
+    return 0
+
+
 def redact_command(command: list[str], prompt: str) -> list[str]:
     return ["<prompt>" if part == prompt else part for part in command]
 
@@ -1004,6 +1257,12 @@ def build_parser() -> argparse.ArgumentParser:
     config.add_argument("--set-bin", action="append", help="RUNNER=/path/to/executable")
     config.add_argument("--clear-bin", action="append", help="Runner whose configured path should be cleared")
 
+    sessions = sub.add_parser("sessions", help="Search local session titles without running an agent")
+    sessions.add_argument("--runner", help="Runner name or alias; defaults to all supported runners")
+    sessions.add_argument("--query", help="Case-insensitive title substring")
+    sessions.add_argument("--limit", type=int, default=20, help="Maximum results (default: 20)")
+    sessions.add_argument("--json", action="store_true", help="Print one JSON object using contract version 1")
+
     run = sub.add_parser("run", help="Run or resume one delegated task")
     run.add_argument("--prompt", required=True)
     run.add_argument("--runner")
@@ -1030,6 +1289,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_onboard(args, state_dir)
         if args.command == "config":
             return cmd_config(args, state_dir)
+        if args.command == "sessions":
+            return cmd_sessions(args, state_dir)
         if args.command == "run":
             return cmd_run(args, state_dir)
         raise DelegateError(f"Unknown command: {args.command}")

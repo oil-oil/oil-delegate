@@ -3,7 +3,7 @@ name: oil-delegate
 description: "把边界清楚的单次任务委托给 Claude Code（cc）、WorkBuddy（wb）、Antigravity（agy）、Codex、OpenCode、DeepSeek Harness（dsh）、Grok Build（grok）或 Kimi Code（kimi）CLI，返回结构化结果并续接原会话；处理首次静默扫描、启用执行器与默认选择。用户明确要求 oil-delegate、统一调用或用上述全称/别名继续这些外部 CLI Agent 时使用；不用于普通直接问答、显式 /codex、需要主线看板与多话题编排的请求。"
 license: MIT
 metadata:
-  version: "0.2.0"
+  version: "0.3.0"
 ---
 
 # oil-delegate
@@ -93,6 +93,21 @@ DELEGATE run --runner <原 runner> \
 ```
 
 续接只发送本轮新信息，不重复整个任务。跨 runner 不能复用 session ID；需要第二意见时开启新任务并补充必要背景。DSH 续接必须使用原 cwd，其 ownership、preset 与 cwd 校验失败时如实报告，不绕过。
+
+### 按标题查找已有会话
+
+供 oil-superagent 收编已有话题时使用，无需 onboarding 或启用 runner：
+
+```text
+DELEGATE sessions --query "标题关键词" --limit 20 --json
+DELEGATE sessions --runner anti --query "标题关键词" --json
+```
+
+省略 `--runner` 搜索全部已接入来源；名称和别名沿用统一解析，新增 `anti` → `antigravity`。关键词仅匹配标题，忽略大小写；完全相等的标题优先，其余按更新时间倒序，`--limit` 为正整数，默认 20。
+
+只读取会话元数据，不读取对话正文、不调用模型、不联网、不写配置或运行产物。JSON 经 `emit()` 输出，`contract_version` 仍为 1：`status: OK`、`sessions`、`unsupported`、`errors`、`skipped`。每条会话包含 `runner`、`session_id`、`title`、`workspace`、`updated_at`、`resume_command`、`source`；时间统一为 UTC ISO 8601，缺失目录或时间为 `null`，未命名标题为空字符串。坏行逐行跳过，数量记入 `skipped[runner]`；来源读取失败才记录在 `errors`，保留其他来源结果，退出码仍为 0。
+
+已接入 Kimi 官方列表、Codex 本地索引与 Antigravity 本地数据库。来源限制、未支持原因和数据根目录环境变量见 [Runner 适配参考](references/runners.md#会话发现约束)。
 
 ### 4. 验收与失败恢复
 
