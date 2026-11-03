@@ -3,7 +3,7 @@ name: oil-delegate
 description: "把边界清楚的单次任务委托给 Claude Code（cc）、WorkBuddy（wb）、Antigravity（agy）、Codex、OpenCode、DeepSeek Harness（dsh）、Grok Build（grok）或 Kimi Code（kimi）CLI，返回结构化结果并续接原会话；处理首次静默扫描、启用执行器与默认选择。用户明确要求 oil-delegate、统一调用或用上述全称/别名继续这些外部 CLI Agent 时使用；不用于普通直接问答、显式 /codex、需要主线看板与多话题编排的请求。"
 license: MIT
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
 ---
 
 # oil-delegate
@@ -102,7 +102,9 @@ DELEGATE run --runner <原 runner> \
 
 ## 输出与停止条件
 
-成功后脚本输出 `status`、`session_id`、`runner`、`output_path`、`result_path`、`events_path` 和 `elapsed`。每次运行有独立目录，包含 prompt、精简 Markdown、结构化 result、原始 stdout/stderr 与事件日志。
+成功后脚本输出 `status`、`session_id`、`runner`、`output_path`、`result_path`、`events_path` 和 `elapsed`。每次运行有独立目录，包含 prompt、精简 Markdown、结构化 result、原始 stdout/stderr 与事件日志。result 里的 `resume_command` 是用户在终端直接续接该会话的命令。
+
+给其他程序调用时追加 `--json`：stdout 只输出一个 JSON 对象，带 `contract_version`（当前为 1）。成功、失败、`NEEDS_ONBOARDING`、`NEEDS_RUNNER_CHOICE`、`DRY_RUN` 和参数错误（`status: ERROR`）都用这个格式，退出码与普通模式一致。
 
 最终回复只保留用户需要的结论、实际改动、验证证据、未完成事项和必要 session ID。完成当前委托与验收后停止，不扩展成多话题管理，也不自动生成看板。
 

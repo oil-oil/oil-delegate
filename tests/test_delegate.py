@@ -499,6 +499,63 @@ class DelegateTestCase(unittest.TestCase):
         self.assertEqual(bad_result["status"], "failed")
         self.assertIn("bad final", bad_result["error"])
 
+    def test_json_output_contract_and_resume_commands(self) -> None:
+        self.onboard_all()
+        # Fake CLIs live at custom paths, so only the arguments after the executable are compared.
+        expected = {
+            "claude": "--resume fake-claude-session",
+            "antigravity": "--conversation fake-antigravity-session",
+            "codex": "resume fake-codex-session",
+            "opencode": "--session fake-opencode-session",
+            "dsh": "tui --resume fake-dsh-session",
+            "grok": "--resume fake-grok-session",
+            "kimi": "-S fake-kimi-session",
+        }
+        for runner, command in expected.items():
+            mode = "write" if runner == "kimi" else "read"
+            proc = self.run_cli(
+                "run", "--runner", runner, "--workspace", str(self.workspace), "--mode", mode,
+                "--prompt", "inspect", "--json",
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+            payload = json.loads(proc.stdout)
+            self.assertEqual(payload["contract_version"], 1)
+            self.assertEqual(payload["status"], "completed")
+            self.assertEqual(payload["runner"], runner)
+            self.assertTrue(payload["resume_command"].endswith(" " + command), msg=payload["resume_command"])
+            stored = json.loads(Path(payload["result_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(stored["resume_command"], payload["resume_command"])
+
+        dry = json.loads(
+            self.run_cli(
+                "run", "--runner", "agy", "--workspace", str(self.workspace), "--prompt", "x",
+                "--dry-run", "--json",
+            ).stdout
+        )
+        self.assertEqual((dry["status"], dry["runner"], dry["contract_version"]), ("DRY_RUN", "antigravity", 1))
+
+    def test_json_mode_reports_errors_and_keeps_exit_codes(self) -> None:
+        self.onboard_all()
+        refused = self.run_cli(
+            "run", "--runner", "kimi", "--workspace", str(self.workspace), "--mode", "read",
+            "--prompt", "x", "--dry-run", "--json",
+        )
+        self.assertEqual(refused.returncode, 1)
+        payload = json.loads(refused.stdout)
+        self.assertEqual(payload["status"], "ERROR")
+        self.assertTrue(payload["error"])
+
+        timed = self.run_cli(
+            "run", "--runner", "claude", "--workspace", str(self.workspace), "--prompt", "x",
+            "--timeout", "1", "--json", extra_env={"FAKE_SLEEP": "3"},
+        )
+        self.assertEqual(timed.returncode, 124)
+        self.assertEqual(json.loads(timed.stdout)["status"], "failed")
+
+        choice = self.run_cli("run", "--workspace", str(self.workspace), "--prompt", "x", "--json")
+        self.assertEqual(choice.returncode, 11)
+        self.assertEqual(json.loads(choice.stdout)["status"], "NEEDS_RUNNER_CHOICE")
+
     def test_parallel_runs_use_distinct_result_paths(self) -> None:
         self.onboard_all()
         processes = [

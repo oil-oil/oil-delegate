@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -61,6 +62,19 @@ RUNNER_ALIASES = {
     "deepseek-harness": "dsh",
     "grok-build": "grok",
     "kimi-code": "kimi",
+}
+# Bump when the `run --json` result fields change incompatibly.
+CONTRACT_VERSION = 1
+# Interactive commands that reopen a headless session; {bin} is the detected executable name.
+RESUME_TEMPLATES = {
+    "claude": ("{bin}", "--resume", "{sid}"),
+    "workbuddy": ("{bin}", "--resume", "{sid}"),
+    "antigravity": ("{bin}", "--conversation", "{sid}"),
+    "codex": ("{bin}", "resume", "{sid}"),
+    "opencode": ("{bin}", "--session", "{sid}"),
+    "dsh": ("{bin}", "tui", "--resume", "{sid}"),
+    "grok": ("{bin}", "--resume", "{sid}"),
+    "kimi": ("{bin}", "-S", "{sid}"),
 }
 EXIT_NEEDS_ONBOARDING = 10
 EXIT_NEEDS_RUNNER_CHOICE = 11
@@ -557,6 +571,18 @@ def build_invocation(
     raise DelegateError(f"Unsupported runner: {runner}")
 
 
+def resume_command(runner: str, binary: str, session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    # Standard executable names stay short; custom paths are kept in full so the command still works.
+    name = Path(binary).name if Path(binary).name in RUNNER_BINARIES[runner] else binary
+    return shlex.join(part.format(bin=name, sid=session_id) for part in RESUME_TEMPLATES[runner])
+
+
+def emit(payload: dict[str, Any]) -> None:
+    print(json.dumps({"contract_version": CONTRACT_VERSION, **payload}, ensure_ascii=False, indent=2))
+
+
 def redact_command(command: list[str], prompt: str) -> list[str]:
     return ["<prompt>" if part == prompt else part for part in command]
 
@@ -814,7 +840,7 @@ def execute_run(args: argparse.Namespace, state_dir: Path, config: dict[str, Any
             "stdin": stdin_input is not None,
             "environment_overrides": env_updates,
         }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        emit(payload)
         return 0
 
     run_id = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:10]}"
@@ -887,6 +913,7 @@ def execute_run(args: argparse.Namespace, state_dir: Path, config: dict[str, Any
         "runner": runner,
         "workspace": str(workspace),
         "mode": args.mode,
+        "resume_command": resume_command(runner, binary_info["path"], parsed["session_id"]),
         "command": safe_command,
         "environment_overrides": env_updates,
         "output_path": str(paths["output"]),
@@ -900,6 +927,13 @@ def execute_run(args: argparse.Namespace, state_dir: Path, config: dict[str, Any
     }
     atomic_write_json(paths["result"], result)
 
+    if parsed["status"] == "completed":
+        return_code = 0
+    else:
+        return_code = exit_code if 0 < exit_code < 256 else 1
+    if args.json:
+        emit(result)
+        return return_code
     print(f"status={parsed['status']}")
     print(f"session_id={parsed['session_id'] or ''}")
     print(f"runner={runner}")
@@ -907,9 +941,7 @@ def execute_run(args: argparse.Namespace, state_dir: Path, config: dict[str, Any
     print(f"result_path={paths['result']}")
     print(f"events_path={paths['events']}")
     print(f"elapsed={elapsed:.1f}s")
-    if parsed["status"] != "completed":
-        return exit_code if 0 < exit_code < 256 else 1
-    return 0
+    return return_code
 
 
 def cmd_run(args: argparse.Namespace, state_dir: Path) -> int:
@@ -919,7 +951,7 @@ def cmd_run(args: argparse.Namespace, state_dir: Path) -> int:
         payload["how_to_onboard"] = (
             "delegate.py onboard --enable <runners> --default-runner <runner|ask>"
         )
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        emit(payload)
         return EXIT_NEEDS_ONBOARDING
 
     if not args.runner and not config.get("default_runner"):
@@ -929,7 +961,7 @@ def cmd_run(args: argparse.Namespace, state_dir: Path) -> int:
             "detected_runners": scan_runners(config),
             "message": "Choose a runner for this task or configure a default runner.",
         }
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        emit(payload)
         return EXIT_NEEDS_RUNNER_CHOICE
 
     if not args.runner:
@@ -962,6 +994,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--session")
     run.add_argument("--timeout", type=int, default=DEFAULT_RUN_TIMEOUT)
     run.add_argument("--dry-run", action="store_true")
+    run.add_argument(
+        "--json",
+        action="store_true",
+        help="Print one JSON object (result, status payload or error) instead of key=value lines",
+    )
     return parser
 
 
@@ -978,7 +1015,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_run(args, state_dir)
         raise DelegateError(f"Unknown command: {args.command}")
     except DelegateError as exc:
-        sys.stderr.write(f"[ERROR] {exc}\n")
+        if getattr(args, "json", False):
+            emit({"status": "ERROR", "error": str(exc)})
+        else:
+            sys.stderr.write(f"[ERROR] {exc}\n")
         return 1
 
 
