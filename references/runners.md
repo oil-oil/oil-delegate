@@ -6,6 +6,7 @@
 
 - [共同约束](#共同约束)
 - [会话发现约束](#会话发现约束)
+- [会话导出约束](#会话导出约束)
 - [Claude Code](#claude-code)
 - [WorkBuddy](#workbuddy)
 - [Antigravity](#antigravity)
@@ -28,7 +29,7 @@
 
 ## 会话发现约束
 
-`sessions [--runner <名称或别名>] [--query <标题关键词>] [--limit N] [--json]` 独立于启用池和默认 runner。只读取标题、ID、目录和更新时间，不启动任务、不调用模型、不联网。搜索不区分大小写，完全相等的标题优先，其余按更新时间倒序；全局限制默认 20。`source` 区分 `official` 与 `local-store`，后者属于产品内部格式，升级后可能变化。
+`sessions [--runner <名称或别名>] [--query <标题关键词>] [--limit N] [--json]` 独立于启用池和默认 runner。只读取标题、ID、目录和更新时间，不启动任务、不调用模型、不联网。搜索不区分大小写，完全相等的标题优先，其余按更新时间倒序；全局限制默认 20。`source` 区分 `official`、`local-store` 与 `desktop-store`；后两者属于产品内部格式，升级后可能变化。每条结果包含布尔值 `resumable`；值为 false 时 `resume_command` 为 null。它表示来源是否支持 CLI 续接，不保证登录、权限或数据仍然有效。
 
 | 数据根目录 | 默认值 | 环境变量覆盖 |
 | --- | --- | --- |
@@ -36,10 +37,20 @@
 | Codex | `~/.codex` | 官方 `CODEX_HOME` |
 | Antigravity CLI | `~/.gemini/antigravity-cli` | `OIL_DELEGATE_ANTIGRAVITY_CLI_HOME` |
 | Antigravity | `~/.gemini/antigravity` | `OIL_DELEGATE_ANTIGRAVITY_HOME` |
+| Claude 桌面元数据（macOS） | `~/Library/Application Support/Claude/claude-code-sessions` | `OIL_DELEGATE_CLAUDE_DESKTOP_HOME` |
+| Claude Code 数据 | `~/.claude` | `CLAUDE_CONFIG_DIR` |
 
 仅在这些本地根目录内读取，拒绝经过符号链接、云目录或挂载视图；遍历时跳过符号链接目录与文件。不扫描工作目录本身。缺失的本地索引/数据库返回空列表；缺少官方 CLI 或来源读取失败写入 `errors[runner]`。某个 Antigravity 数据库失败仍保留另一个数据库的结果。无法可靠发现的 runner 列入 `unsupported`，不会尝试读取对话文件来猜标题。
 
 单行元数据无效时跳过该行，保留同一来源中的其他会话，不写入 `errors`；缺失、非字符串或空字符串 ID 均无效。`title: null` 或缺失标题统一为空字符串，保留会话，有非空 `--query` 时自然不匹配。JSON 的 `skipped` 按 runner 统计筛选和限量之前跳过的坏行数，无坏行时为 `{}`；去重、未匹配标题和超出限量的会话不计入跳过数。
+
+## 会话导出约束
+
+`sessions export --runner <名称或别名> --session-id <ID> --out <Markdown> [--max-turns N] [--force] [--json]` 不依赖 onboarding 或 CLI 安装，不启动 CLI、不调用模型、不联网。只支持 Antigravity 与 Claude；其他 runner 返回 `status: ERROR`、说明原因、退出 1。
+
+导出标题、工作目录、会话/导出时间与按时间排序的文字。每条用户消息或 Agent 文字回复计一轮，`turns` 为实际保留轮数；`omitted_turns` 为省略的较早轮数。默认保留最近 30 轮，可用正整数 `--max-turns` 调整；截断提示在标题之后。时间缺失时保留来源顺序，并接在此前的已知时间后。没有标题时使用 ID，缺失目录为 null，缺失时间标为未知。JSON 通过 `emit()` 输出 `status/path/title/workspace/turns/omitted_turns/runner/session_id` 与 `contract_version: 1`，不含正文。
+
+输出父目录须存在，默认独占创建，已有文件不会被覆盖；`--force` 使用临时文件替换，拒绝符号链接输出及 CLI 数据目录。源目录和所选正文文件均排除符号链接、挂载、云目录与 macOS dataless 占位文件。不会复制、导入或修改原始会话。正文格式损坏、未知 Antigravity step_format 或必要字段不匹配时明确报错，不生成伪造的交接文本。
 
 ## Claude Code
 
@@ -49,7 +60,10 @@
 - write：`--dangerously-skip-permissions`。
 - 解析：最终 JSON 的 `session_id`、`result`、`is_error`。
 - 认证：先用官方交互式 CLI 完成安装与登录；不要在包装器中输入或转存密钥。
-- 会话发现：`unsupported`。本机 2.1.314 没有官方历史会话列表子命令；自定义标题与 AI 标题分别以 `custom-title` / `customTitle`、`ai-title` / `aiTitle` 记录混存于 Claude Code 数据目录下的 `projects/<项目>/<会话>.jsonl`。另有 `<会话>/custom-title.json` sidecar，实测只含 `customTitle`，不能覆盖完整标题与目录元数据；本机未发现独立的 `sessions-index.json`。无法确认完整、及时的独立标题索引，因此不扫描对话 JSONL，也不以首条 prompt 或摘要代替标题。稳定性：暂未接入，不能依赖旧版索引格式。
+- 会话发现：macOS 的 `desktop-store`，固定两层读取 `claude-code-sessions/<a>/<b>/local_<id>.json` 的 `cliSessionId`、`cwd`、`title`、`lastActivityAt`，跳过 `isArchived`。使用 `cliSessionId` 作为 `session_id`，不使用桌面的 `sessionId` 或文件名 ID。同 CLI ID 保留最新元数据。非 macOS 或元数据目录不存在时安静返回空列表。
+- 续接判断：将 cwd 中每个非 ASCII 字母、数字或连字符替换为 `-`，定位 `$CLAUDE_CONFIG_DIR/projects/<编码 cwd>/<cliSessionId>.jsonl`。仅检查该文件存在，不读正文；存在时 `resumable=true`，生成 `claude --resume <cliSessionId>`，否则 false/null。依据是本地桌面元数据与对应 JSONL 的实际关联，不意味着可以导入缺失的正文。
+- 导出：优先使用桌面元数据定位正文；没有匹配时只枚举 `projects` 的一层项目目录，查找指定 `<session_id>.jsonl`，多个项目命中则报歧义，不递归读取 subagents。只读取 `type=user/assistant` 的 `message.content` 字符串或 `type=text` 块；跳过 `tool_use`、`tool_result`、thinking、图片及其他非文字块，排除 `isSidechain/isMeta/isCompactSummary`。相同 uuid 保留最后记录。无桌面标题时采用指定 JSONL 的最新 custom-title，其次 ai-title；不从 prompt 猜标题。CLI 来源不依赖桌面平台，可直接按 ID 导出。
+- 稳定性：桌面 JSON 与 JSONL 均为内部格式，本机 2.1.314 的字段已离线核对。没有可靠的独立 CLI 历史标题索引，故列表仍不扫描 CLI 正文；仅桌面元数据覆盖的会话可被发现。
 
 官方参考：[Claude Code CLI usage](https://docs.anthropic.com/en/docs/claude-code/cli-usage)。
 
@@ -74,8 +88,13 @@
 - write：`--dangerously-skip-permissions`。
 - 解析：`conversation_id`、`response`、`status`；只有 `SUCCESS` 可视为协议成功。
 - 认证：headless 使用缓存凭据，需先通过官方交互式 `agy` 完成认证；未认证时应报错而不是等待输入。
-- 会话发现：`local-store`。读取上述两个根目录中的 `conversation_summaries.db`，只查询 `conversation_summaries` 表的 `conversation_id`、`title`、`workspace_uris`、`last_modified_time`；将 JSON 列表中首个本机 `file://` URI 解码为目录。同 ID 跨库重复时保留更新时间较新的元数据。
+- 会话发现：读取上述两个根目录中的 `conversation_summaries.db`，只查询 `conversation_summaries` 表的 `conversation_id`、`title`、`workspace_uris`、`last_modified_time`；将 JSON 列表中首个本机 `file://` URI 解码为目录。同 ID 跨库重复时保留更新时间较新的元数据及其来源判断。
+- 续接判断：CLI 根目录为 `local-store`、`resumable=true`；IDE 根目录为 `desktop-store`、`resumable=false`、`resume_command=null`。实测两套存储独立，IDE ID 在 CLI 存储中不存在，agy 没有导入选项，不能向 IDE ID 提供 `agy --conversation` 命令。
+- 导出：在两个根目录的 `conversations/<id>.db` 中定位单个数据库，优先匹配元数据来源；缺少摘要时仍可按 ID 定位。查询 `steps` 的 `idx/step_type/step_format/step_payload`，按 idx 读取，再按消息时间排序。只解析类型 14、15；其他类型不提取文字。
+- protobuf 判断依据（本地 IDE 样本）：`step_payload` 是完整未压缩消息，field 1 的 varint 与 `step_type` 相等，field 4 为状态，field 5 为元数据；创建时间在 `5 → 1 → {1: seconds, 2: nanos}`。6 个类型 14 步骤的用户输入位于 length-delimited `19 → 2`；`19 → 3` 同时含重复文字块、图片/上下文结构，不能拼接全部字符串。176 个类型 15 中仅 6 个含回复文字 `20 → 1`，且各自与 `20 → 8` 完全相同，故只取 field 1 一次；`20 → 3` 为思考文字，`20 → 7` 是带工具名/JSON 参数的重复结构，均不导出。有回复与工具并存时仍只保留回复字段。
+- 排除依据：类型 132（191 行）在 `140` 分支带调用与执行结果；101（6 行）的 `114 → 3` 均为 `task_notification`，其余字段带任务通知与步骤/文件引用；23（1 行）的 `30` 分支含会话压缩摘要、引用和用户输入副本，均不能视为新的用户/Agent 回复。实现按明确的 field/wire 路径解析，不搜索可打印字符串，不把思考、工具输出或摘要当正文。仅用标准库实现带边界检查的 protobuf varint/length-delimited（以及跳过 fixed32/fixed64）解码；未知字段跳过，已知消息损坏时报错。
 - 稳定性：内部 SQLite 格式。以 `file:<path>?immutable=1` URI 打开，不创建锁或 sidecar；只读已 checkpoint 的主库快照，WAL 中尚未 checkpoint 的新增/改名可能暂不可见，不执行 checkpoint。时间兼容 ISO 8601 与 Unix 秒/毫秒。
+- 限制：当前正文适配 `step_format=0` 与上述字段布局；CLI 导出使用同一布局并有假数据覆盖，本机 CLI 摘要对应的正文文件缺失，尚无真实 CLI 正文验证。未来的新步骤类型默认忽略，字段变化可能需要更新适配。
 
 官方参考：[Antigravity Headless Mode](https://antigravity.google/docs/cli/headless/)。
 

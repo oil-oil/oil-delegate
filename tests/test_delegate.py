@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import shlex
@@ -161,6 +163,8 @@ class DelegateTestCase(unittest.TestCase):
         env["HOME"] = str(self.root / "home")
         env["CODEX_HOME"] = str(self.root / "codex-home")
         env["KIMI_CODE_HOME"] = str(self.root / "kimi-home")
+        env["CLAUDE_CONFIG_DIR"] = str(self.root / "claude-home")
+        env["OIL_DELEGATE_CLAUDE_DESKTOP_HOME"] = str(self.root / "claude-desktop")
         env["OIL_DELEGATE_ANTIGRAVITY_CLI_HOME"] = str(self.root / "anti-cli-home")
         env["OIL_DELEGATE_ANTIGRAVITY_HOME"] = str(self.root / "anti-home")
         for key in list(env):
@@ -248,7 +252,35 @@ class DelegateTestCase(unittest.TestCase):
 
     def test_onboarding_choice_alias_default_and_merge(self) -> None:
         record_path = self.root / "record.json"
-        before = self.run_task("claude", extra_env={"FAKE_RECORD": str(record_path)})
+        direct = self.run_task("cc", extra_env={"FAKE_RECORD": str(record_path)})
+        self.assertEqual(direct.returncode, 0, msg=direct.stderr)
+        self.assertEqual(self.result_of(direct)["runner"], "claude")
+        self.assertFalse((self.state_dir / "config.json").exists())
+        record_path.unlink()
+
+        missing_before = self.run_cli(
+            "run",
+            "--runner",
+            "opencode",
+            "--workspace",
+            str(self.workspace),
+            "--prompt",
+            "inspect",
+            remove_env=["OIL_DELEGATE_OPENCODE_BIN"],
+        )
+        self.assertEqual(missing_before.returncode, 1)
+        self.assertIn("Command not found", missing_before.stderr)
+
+        before = self.run_cli(
+            "run",
+            "--workspace",
+            str(self.workspace),
+            "--mode",
+            "read",
+            "--prompt",
+            "inspect",
+            extra_env={"FAKE_RECORD": str(record_path)},
+        )
         self.assertEqual(before.returncode, 10)
         before_payload = json.loads(before.stdout)
         self.assertEqual(before_payload["status"], "NEEDS_ONBOARDING")
@@ -453,8 +485,9 @@ class DelegateTestCase(unittest.TestCase):
                     self.assertIn('sandbox_mode="read-only"', record["argv"])
 
     def test_default_mode_is_full_access(self) -> None:
+        # The parser leaves --mode empty so a role can supply its own mode; a plain run still writes.
         args = DELEGATE.build_parser().parse_args(["run", "--prompt", "inspect"])
-        self.assertEqual(args.mode, "write")
+        self.assertIsNone(args.mode)
 
         self.onboard_all()
         record_path = self.root / "record.json"
@@ -472,6 +505,88 @@ class DelegateTestCase(unittest.TestCase):
         self.assertEqual(self.result_of(proc)["mode"], "write")
         record = self.record_of()
         self.assertIn("--always-approve", record["argv"])
+
+    def run_role(self, role: str, *extra: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        return self.run_cli(
+            "run",
+            "--role",
+            role,
+            "--workspace",
+            str(self.workspace),
+            "--prompt",
+            "review the fixture",
+            *extra,
+            extra_env=env,
+        )
+
+    def test_role_is_asked_once_then_saved_and_review_roles_force_read_mode(self) -> None:
+        self.onboard_all()
+        asked = self.run_role("review", "--dry-run")
+        self.assertEqual(asked.returncode, DELEGATE.EXIT_NEEDS_ROLE_CHOICE, msg=asked.stderr)
+        payload = json.loads(asked.stdout)
+        self.assertEqual(payload["status"], "NEEDS_ROLE_CHOICE")
+        self.assertEqual(payload["mode"], "read")
+        self.assertEqual(payload["candidates"][0], "host")
+        self.assertNotIn("kimi", payload["candidates"])
+        self.assertIn("kimi", json.loads(self.run_role("implement", "--dry-run").stdout)["candidates"])
+
+        rejected = self.run_cli("config", "--set-role", "review=kimi")
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("read-only", rejected.stderr)
+
+        saved = self.run_cli("config", "--set-role", "review=cc")
+        self.assertEqual(saved.returncode, 0, msg=saved.stderr)
+        self.assertEqual(json.loads(saved.stdout)["roles"], {"review": ["claude"]})
+
+        record_path = self.root / "record.json"
+        proc = self.run_role("review", env={"FAKE_RECORD": str(record_path)})
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        result = self.result_of(proc)
+        self.assertEqual((result["runner"], result["role"], result["mode"]), ("claude", "review", "read"))
+        self.assertIn("plan", self.record_of()["argv"])
+
+        conflict = self.run_role("review", "--mode", "write")
+        self.assertEqual(conflict.returncode, 1)
+        self.assertIn("always runs in read mode", conflict.stderr)
+
+        # An explicitly named runner wins over the saved one, but the role still decides the mode.
+        explicit = self.run_role("review", "--runner", "codex", "--dry-run")
+        self.assertEqual(
+            (json.loads(explicit.stdout)["runner"], json.loads(explicit.stdout)["mode"]), ("codex", "read")
+        )
+
+    def test_host_role_and_diagnose_slots(self) -> None:
+        # Host-only preferences work without onboarding or any installed runner.
+        self.assertEqual(self.run_cli("config", "--set-role", "critique=host").returncode, 0)
+        host = self.run_role("critique")
+        self.assertEqual(host.returncode, DELEGATE.EXIT_USE_HOST, msg=host.stderr)
+        self.assertEqual(json.loads(host.stdout)["status"], "USE_HOST")
+        self.assertFalse((self.state_dir / "runs").exists())
+
+        for bad in ("diagnose=codex", "diagnose=codex,codex", "review=claude,codex", "triage=codex"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.run_cli("config", "--set-role", bad).returncode, 1)
+
+        self.assertEqual(self.run_cli("config", "--set-role", "diagnose=host,codex").returncode, 0)
+        self.assertEqual(self.run_role("diagnose").returncode, DELEGATE.EXIT_USE_HOST)
+        second = self.run_role("diagnose", "--role-slot", "2", "--dry-run")
+        self.assertEqual(second.returncode, 0, msg=second.stderr)
+        self.assertEqual(json.loads(second.stdout)["runner"], "codex")
+        self.assertEqual(self.run_role("diagnose", "--role-slot", "3", "--dry-run").returncode, 1)
+
+    def test_role_warnings_reset_and_disabled_runner_cleanup(self) -> None:
+        self.onboard_all()
+        same = self.run_cli("config", "--set-role", "implement=codex", "--set-role", "review=codex")
+        self.assertEqual(same.returncode, 0, msg=same.stderr)
+        self.assertIn("same runner", json.loads(same.stdout)["warnings"][0])
+
+        self.run_cli("config", "--set-role", "critique=host")
+        self.assertEqual(self.run_cli("config", "--set-role", "review=ask").returncode, 0)
+        roles = json.loads(self.run_cli("config").stdout)["roles"]
+        self.assertEqual(roles, {"implement": ["codex"], "critique": ["host"]})
+
+        narrowed = self.run_cli("config", "--set-enabled-runners", "claude")
+        self.assertEqual(json.loads(narrowed.stdout)["roles"], {"critique": ["host"]})
 
     def test_dsh_legacy_permission_flags_use_environment(self) -> None:
         self.onboard_all()
@@ -797,7 +912,8 @@ class DelegateTestCase(unittest.TestCase):
             "FAKE_KIMI_SESSIONS": str(fixture), "FAKE_CALL_LOG": str(log), "FAKE_RECORD": str(record),
         })
         row, = payload["sessions"]
-        self.assertEqual(set(row), {"runner", "session_id", "title", "workspace", "updated_at", "resume_command", "source"})
+        self.assertEqual(set(row), {"runner", "session_id", "title", "workspace", "updated_at", "resume_command", "source", "resumable"})
+        self.assertIs(row["resumable"], True)
         self.assertEqual((row["runner"], row["session_id"], row["title"], row["workspace"], row["source"]),
                          ("kimi", "kimi-1", "项目 Plan", "/fixture/project", "official"))
         self.assertEqual(row["updated_at"], "2026-11-03T00:00:00.123000+00:00")
@@ -941,8 +1057,9 @@ class DelegateTestCase(unittest.TestCase):
         self.assertEqual([row["session_id"] for row in payload["sessions"]], ["shared", "unique"])
         row = payload["sessions"][0]
         self.assertEqual((row["runner"], row["title"], row["workspace"], row["updated_at"], row["source"]),
-                         ("antigravity", "New", "/fixture/a b", "2026-11-03T02:00:00.000000+00:00", "local-store"))
-        self.assertEqual(shlex.split(row["resume_command"])[1:], ["--conversation", "shared"])
+                         ("antigravity", "New", "/fixture/a b", "2026-11-03T02:00:00.000000+00:00", "desktop-store"))
+        self.assertIs(row["resumable"], False)
+        self.assertIsNone(row["resume_command"])
 
     def test_sessions_antigravity_uses_immutable_snapshot_without_writes(self) -> None:
         connection = self.write_anti_db("anti cli ?#", [("checkpointed", "Saved", '[]', 1793664000)], wal=True)
@@ -1013,7 +1130,7 @@ class DelegateTestCase(unittest.TestCase):
         self.assertEqual(set(payload["errors"]), {"codex", "kimi"})
         self.assertIn("exited 2", payload["errors"]["kimi"])
         self.assertEqual(payload["skipped"], {})
-        self.assertEqual(payload["unsupported"], ["claude", "workbuddy", "opencode", "dsh", "grok"])
+        self.assertEqual(payload["unsupported"], ["workbuddy", "opencode", "dsh", "grok"])
         self.assertFalse(self.state_dir.exists())
 
     def test_sessions_exact_title_first_then_updated_at_across_runners(self) -> None:
@@ -1065,14 +1182,14 @@ class DelegateTestCase(unittest.TestCase):
                 self.assertEqual(payload["skipped"], {})
 
     def test_sessions_missing_local_roots_are_empty(self) -> None:
-        for runner in ("codex", "anti"):
+        for runner in ("codex", "anti", "claude"):
             with self.subTest(runner=runner):
                 payload = self.sessions_payload("--runner", runner)
                 self.assertEqual((payload["sessions"], payload["errors"], payload["unsupported"]), ([], {}, []))
 
     def test_sessions_unsupported_runner_does_not_start_cli(self) -> None:
         log = self.root / "calls.jsonl"
-        for runner, canonical in (("cc", "claude"), ("wb", "workbuddy"), ("opencode", "opencode"),
+        for runner, canonical in (("wb", "workbuddy"), ("opencode", "opencode"),
                                   ("dsh", "dsh"), ("grok-build", "grok")):
             with self.subTest(runner=runner):
                 payload = self.sessions_payload("--runner", runner, extra_env={"FAKE_CALL_LOG": str(log)})
@@ -1092,6 +1209,298 @@ class DelegateTestCase(unittest.TestCase):
         proc = self.run_cli("sessions", "--runner", "codex")
         self.assertEqual(proc.returncode, 0, msg=proc.stderr)
         self.assertIn("codex\tone\tTitle\t", proc.stdout)
+
+    @staticmethod
+    def proto(*fields: tuple[int, object]) -> bytes:
+        def varint(value: int) -> bytes:
+            result = bytearray()
+            while value > 127:
+                result.append((value & 127) | 128)
+                value >>= 7
+            result.append(value)
+            return bytes(result)
+
+        result = bytearray()
+        for number, value in fields:
+            if isinstance(value, int):
+                result += varint(number << 3) + varint(value)
+            else:
+                value = value.encode() if isinstance(value, str) else value
+                result += varint((number << 3) | 2) + varint(len(value)) + value
+        return bytes(result)
+
+    def anti_step(self, kind: int, text: str | bytes, seconds: int) -> bytes:
+        if kind == 14:
+            # User text also has duplicate chunks and image/context fields; none should be concatenated.
+            body = self.proto((2, text), (3, self.proto((1, "duplicate user"))),
+                              (3, self.proto((2, b"\xff\x00image"))), (12, "private context"))
+        else:
+            body = self.proto((1, text), (3, "private thinking"), (8, text),
+                              (7, self.proto((1, "tool_name"), (3, '{"secret":"tool input"}'))))
+        return self.proto((1, kind), (4, 3), (5, self.proto((1, self.proto((1, seconds), (2, 123000000))))),
+                          (19 if kind == 14 else 20, body), (200, "unknown field"))
+
+    def write_anti_conversation(self, dirname: str, sid: str, steps: list[tuple]) -> Path:
+        path = self.root / dirname / "conversations" / f"{sid}.db"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            connection.execute("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, "
+                               "step_format INTEGER DEFAULT 0, step_payload BLOB)")
+            connection.executemany("INSERT INTO steps(idx,step_type,step_payload) VALUES (?,?,?)", steps)
+            connection.commit()
+        return path
+
+    def write_claude_metadata(self, sid: str, **overrides) -> Path:
+        path = self.root / "claude-desktop" / "account" / "bucket" / f"local_{sid}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {"sessionId": f"desktop-{sid}", "cliSessionId": sid, "cwd": "/fixture/project",
+               "title": "桌面标题", "lastActivityAt": 1793664000123, "isArchived": False, **overrides}
+        path.write_text(json.dumps(row), encoding="utf-8")
+        return path
+
+    def write_claude_jsonl(self, sid: str, rows: list[dict], project: str = "-fixture-project") -> Path:
+        path = self.root / "claude-home" / "projects" / project / f"{sid}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+        return path
+
+    def desktop_sessions_payload(self) -> dict:
+        stdout = io.StringIO()
+        with mock.patch.dict(os.environ, self.base_env(), clear=True), \
+                mock.patch.object(DELEGATE.sys, "platform", "darwin"), contextlib.redirect_stdout(stdout):
+            self.assertEqual(DELEGATE.main(["sessions", "--runner", "cc", "--json"]), 0)
+        return json.loads(stdout.getvalue())
+
+    def export_payload(self, runner: str, sid: str, out: Path, *options: str) -> dict:
+        result = self.run_cli("sessions", "export", "--runner", runner, "--session-id", sid,
+                              "--out", str(out), *options, "--json")
+        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+        return json.loads(result.stdout)
+
+    def test_sessions_antigravity_cli_is_resumable_desktop_is_not(self) -> None:
+        self.write_anti_db("anti-cli-home", [("cli", "CLI", '[]', None)]).close()
+        self.write_anti_db("anti-home", [("desktop", "IDE", '[]', None)]).close()
+        rows = {r["session_id"]: r for r in self.sessions_payload("--runner", "agy")["sessions"]}
+        self.assertIs(rows["cli"]["resumable"], True)
+        self.assertEqual(rows["cli"]["source"], "local-store")
+        self.assertEqual(shlex.split(rows["cli"]["resume_command"])[1:], ["--conversation", "cli"])
+        self.assertEqual((rows["desktop"]["resumable"], rows["desktop"]["resume_command"], rows["desktop"]["source"]),
+                         (False, None, "desktop-store"))
+
+    def test_sessions_claude_desktop_ids_archived_and_transcript_existence(self) -> None:
+        self.write_claude_metadata("available", cwd="/fixture/work space")
+        self.write_claude_metadata("missing")
+        self.write_claude_metadata("archived", isArchived=True)
+        bad = self.write_claude_metadata("bad", cliSessionId=None)
+        transcript = self.write_claude_jsonl("available", [], "-fixture-work-space")
+        # List must test existence only, never decode the body to discover metadata.
+        transcript.write_bytes(b"\xffnot-jsonl")
+        before = (transcript.read_bytes(), transcript.stat().st_mtime_ns, bad.read_bytes())
+        payload = self.desktop_sessions_payload()
+        rows = {r["session_id"]: r for r in payload["sessions"]}
+        self.assertEqual(set(rows), {"available", "missing"})
+        self.assertEqual(rows["available"]["source"], "desktop-store")
+        self.assertEqual(rows["available"]["updated_at"], "2026-11-03T00:00:00.123000+00:00")
+        self.assertEqual(rows["available"]["workspace"], "/fixture/work space")
+        self.assertEqual(rows["available"]["resume_command"], "claude --resume available")
+        self.assertIs(rows["available"]["resumable"], True)
+        self.assertEqual((rows["missing"]["resumable"], rows["missing"]["resume_command"]), (False, None))
+        self.assertEqual(payload["skipped"], {"claude": 1})
+        self.assertEqual((payload["errors"], payload["unsupported"]), ({}, []))
+        self.assertEqual((transcript.read_bytes(), transcript.stat().st_mtime_ns, bad.read_bytes()), before)
+        self.assertFalse(self.state_dir.exists())
+
+    def test_sessions_claude_non_macos_quietly_skips_desktop(self) -> None:
+        self.write_claude_metadata("exists")
+        with mock.patch.object(DELEGATE.sys, "platform", "linux"), \
+                mock.patch.object(DELEGATE, "claude_desktop_home", side_effect=AssertionError("must not inspect")):
+            self.assertEqual(DELEGATE.claude_sessions({}), [])
+
+    def test_sessions_claude_skips_symlinks_cloud_directories_and_placeholders(self) -> None:
+        self.write_claude_metadata("good")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "local_bad.json").write_bytes(b"not JSON")
+        bucket = self.root / "claude-desktop" / "account" / "bucket"
+        (bucket / "local_link.json").symlink_to(outside / "local_bad.json")
+        (self.root / "claude-desktop" / "linked-account").symlink_to(outside, target_is_directory=True)
+        (self.root / "claude-desktop" / "CloudStorage").mkdir()
+        self.assertEqual([r["session_id"] for r in self.desktop_sessions_payload()["sessions"]], ["good"])
+        with mock.patch.object(Path, "lstat", return_value=mock.Mock(st_flags=0x40000000)), \
+                self.assertRaisesRegex(DELEGATE.DelegateError, "placeholder"):
+            DELEGATE.session_root("", self.root / "placeholder")
+
+    def test_export_antigravity_both_stores_text_fields_only_and_recent_turns(self) -> None:
+        for dirname in ("anti-cli-home", "anti-home"):
+            with self.subTest(dirname=dirname):
+                sid = dirname
+                self.write_anti_db(dirname, [(sid, "交接标题", '["file:///fixture/a%20b"]', 1793664020)]).close()
+                source = self.write_anti_conversation(dirname, sid, [
+                    (0, 14, self.anti_step(14, "旧用户", 1793664000)),
+                    (1, 15, self.anti_step(15, "旧回复", 1793664001)),
+                    (2, 132, b"\xffprivate tool output"),  # Never parse unknown/tool steps as text.
+                    (3, 101, b"private checkpoint"), (4, 23, b"private summary"),
+                    (5, 15, self.proto((1, 15), (20, self.proto((3, "thinking only"), (7, "tools only"))))),
+                    (6, 14, self.anti_step(14, "新用户", 1793664010)),
+                    (7, 15, self.anti_step(15, "新回复", 1793664011)),
+                ])
+                before = (source.read_bytes(), source.stat().st_mtime_ns, sorted(p.name for p in source.parent.iterdir()))
+                out = self.root / f"{sid}.md"
+                payload = self.export_payload("ANTI", sid, out, "--max-turns", "2")
+                self.assertEqual(payload, {"contract_version": 1, "status": "OK", "path": str(out),
+                    "title": "交接标题", "workspace": "/fixture/a b", "turns": 2, "omitted_turns": 2,
+                    "runner": "antigravity", "session_id": sid})
+                text = out.read_text()
+                self.assertTrue(text.startswith("# 交接标题\n\n> 已省略较早的 2 轮"))
+                self.assertLess(text.index("## 用户"), text.index("## Agent"))
+                self.assertEqual(text.count("新用户"), 1)
+                self.assertEqual(text.count("新回复"), 1)  # Field 8 duplicates field 1.
+                self.assertIn("2026-11-03T00:00:10.123000+00:00", text)
+                for private in ("旧用户", "旧回复", "private", "thinking", "tools", "duplicate", "unknown", "image"):
+                    self.assertNotIn(private, text)
+                self.assertEqual((source.read_bytes(), source.stat().st_mtime_ns,
+                                  sorted(p.name for p in source.parent.iterdir())), before)
+        self.assertFalse(self.state_dir.exists())
+
+    def test_export_antigravity_immutable_wal_snapshot(self) -> None:
+        path = self.write_anti_conversation("anti-home", "wal", [(0, 14, self.anti_step(14, "saved", 1793664000))])
+        connection = sqlite3.connect(path)
+        self.addCleanup(connection.close)
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("INSERT INTO steps VALUES(1,15,0,?)", (self.anti_step(15, "wal only", 1793664001),))
+        connection.commit()
+        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in path.parent.iterdir()}
+        out = self.root / "wal.md"
+        payload = self.export_payload("agy", "wal", out)
+        self.assertEqual((payload["turns"], payload["omitted_turns"]), (1, 0))
+        self.assertNotIn("wal only", out.read_text())
+        self.assertEqual({p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in path.parent.iterdir()}, before)
+
+    def test_export_antigravity_other_store_failure_does_not_block_local_source(self) -> None:
+        self.write_anti_conversation("anti-home", "local", [(0, 14, self.anti_step(14, "local user", 1793664000))])
+        out = self.root / "local.md"
+        proc = self.run_cli("sessions", "export", "--runner", "anti", "--session-id", "local",
+                           "--out", str(out), "--json", extra_env={
+                               "OIL_DELEGATE_ANTIGRAVITY_CLI_HOME": str(self.root / "Library/CloudStorage/provider")})
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["turns"], 1)
+        self.assertIn("local user", out.read_text())
+
+    def test_export_antigravity_unknown_format_rejected_and_binary_text_skipped(self) -> None:
+        path = self.write_anti_conversation("anti-home", "format", [(0, 14, self.anti_step(14, "text", 1793664000))])
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            connection.execute("UPDATE steps SET step_format=1")
+            connection.commit()
+        out = self.root / "format.md"
+        proc = self.run_cli("sessions", "export", "--runner", "anti", "--session-id", "format",
+                            "--out", str(out), "--json")
+        self.assertEqual((proc.returncode, json.loads(proc.stdout)["status"]), (1, "ERROR"))
+        self.assertIn("step_format", json.loads(proc.stdout)["error"])
+        self.assertFalse(out.exists())
+        self.write_anti_conversation("anti-home", "binary", [(0, 14, self.anti_step(14, b"\xff\x00", 1793664000))])
+        self.assertEqual(self.export_payload("anti", "binary", out)["turns"], 0)
+
+    def test_export_claude_jsonl_text_filter_chronology_titles_and_default_limit(self) -> None:
+        rows = [{"type": "ai-title", "aiTitle": "AI 标题"}, {"type": "custom-title", "customTitle": "用户标题"},
+                {"type": "system", "message": {"content": "system secret"}},
+                {"type": "assistant", "isSidechain": True, "message": {"content": "sidechain secret"}},
+                {"type": "user", "isMeta": True, "message": {"content": "meta secret"}}]
+        for index in reversed(range(32)):
+            rows.append({"type": "user" if index % 2 == 0 else "assistant", "cwd": "/fixture/project",
+                         "uuid": f"message-{index}", "timestamp": f"2026-11-03T00:00:{index:02d}Z",
+                         "message": {"content": [{"type": "text", "text": f"正文 {index:02d}"},
+                             {"type": "tool_use", "input": {"text": "tool secret"}},
+                             {"type": "tool_result", "content": "result secret"},
+                             {"type": "image", "source": {"data": "image secret"}},
+                             {"type": "thinking", "thinking": "thinking secret"}]}})
+        rows.append({"type": "user", "message": {"content": [{"type": "tool_result", "content": "tool only"}]}})
+        source = self.write_claude_jsonl("cli", rows)
+        before = (source.read_bytes(), source.stat().st_mtime_ns)
+        out = self.root / "claude.md"
+        result = self.export_payload("cc", "cli", out)
+        self.assertEqual((result["title"], result["workspace"], result["turns"], result["omitted_turns"]),
+                         ("用户标题", "/fixture/project", 30, 2))
+        text = out.read_text()
+        self.assertLess(text.index("正文 02"), text.index("正文 31"))
+        self.assertNotIn("正文 00", text)
+        self.assertNotIn("正文 01", text)
+        self.assertNotIn("secret", text)
+        self.assertNotIn("tool only", text)
+        self.assertEqual((source.read_bytes(), source.stat().st_mtime_ns), before)
+
+    def test_export_claude_desktop_uses_cli_id_and_metadata(self) -> None:
+        self.write_claude_metadata("cli-id")
+        self.write_claude_jsonl("cli-id", [{"type": "user", "message": {"content": "用户正文"}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "最终回复"}]}}])
+        stdout = io.StringIO()
+        out = self.root / "desktop.md"
+        with mock.patch.dict(os.environ, self.base_env(), clear=True), \
+                mock.patch.object(DELEGATE.sys, "platform", "darwin"), contextlib.redirect_stdout(stdout):
+            code = DELEGATE.main(["sessions", "export", "--runner", "claude", "--session-id", "cli-id",
+                                  "--out", str(out), "--json"])
+        self.assertEqual(code, 0)
+        result = json.loads(stdout.getvalue())
+        self.assertEqual((result["session_id"], result["title"], result["turns"]), ("cli-id", "桌面标题", 2))
+        self.assertIn("最终回复", out.read_text())
+
+    def test_export_force_and_plain_output(self) -> None:
+        self.write_claude_jsonl("replace", [{"type": "user", "message": {"content": "message"}}])
+        out = self.root / "handoff.md"
+        out.write_text("keep me")
+        result = self.run_cli("sessions", "export", "--runner", "cc", "--session-id", "replace",
+                              "--out", str(out), "--json")
+        self.assertEqual((result.returncode, json.loads(result.stdout)["status"]), (1, "ERROR"))
+        self.assertIn("--force", json.loads(result.stdout)["error"])
+        self.assertEqual(out.read_text(), "keep me")
+        self.assertEqual(self.export_payload("cc", "replace", out, "--force")["turns"], 1)
+        plain = self.run_cli("sessions", "export", "--runner", "cc", "--session-id", "replace",
+                             "--out", str(out), "--force")
+        self.assertEqual(plain.returncode, 0, msg=plain.stderr)
+        self.assertIn("turns=1", plain.stdout)
+        self.assertNotIn("message", plain.stdout)
+
+    def test_export_errors_are_json_and_do_not_create_output_or_start_cli(self) -> None:
+        out = self.root / "error.md"
+        log = self.root / "cli-calls.jsonl"
+        for runner, sid, options in [(runner, "sid", []) for runner in RUNNERS if runner not in {"claude", "antigravity"}] + [
+                ("unknown", "sid", []), ("cc", "missing", []), ("anti", "missing", []),
+                ("cc", "../escape", []), ("anti", "a/b", []), ("cc", "sid", ["--max-turns", "0"])]:
+            with self.subTest(runner=runner, sid=sid, options=options):
+                proc = self.run_cli("sessions", "export", "--runner", runner, "--session-id", sid,
+                    "--out", str(out), *options, "--json", extra_env={"FAKE_CALL_LOG": str(log)})
+                self.assertEqual(proc.returncode, 1, msg=proc.stderr)
+                payload = json.loads(proc.stdout)
+                self.assertEqual((payload["status"], payload["contract_version"]), ("ERROR", 1))
+                self.assertTrue(payload["error"])
+                self.assertFalse(out.exists())
+        self.assertFalse(log.exists())
+
+    def test_export_rejects_corrupt_payloads_jsonl_and_unsafe_paths(self) -> None:
+        out = self.root / "error.md"
+        for payload in (b"\x08\x80", b"\x00", b"\x9a\x01\xff", self.proto((1, 15), (19, b""))):
+            path = self.write_anti_conversation("anti-home", "bad", [(0, 14, payload)])
+            proc = self.run_cli("sessions", "export", "--runner", "anti", "--session-id", "bad",
+                                "--out", str(out), "--json")
+            self.assertEqual((proc.returncode, json.loads(proc.stdout)["status"]), (1, "ERROR"))
+            self.assertFalse(out.exists())
+            path.unlink()
+        source = self.write_claude_jsonl("safe", [{"type": "user", "message": {"content": "safe text"}}])
+        for destination in (source, source.parent / "new.md"):
+            proc = self.run_cli("sessions", "export", "--runner", "cc", "--session-id", "safe",
+                               "--out", str(destination), "--force", "--json")
+            self.assertEqual((proc.returncode, json.loads(proc.stdout)["status"]), (1, "ERROR"))
+            self.assertNotIn("#", source.read_text())
+        linked = self.root / "linked.md"
+        linked.symlink_to(source)
+        proc = self.run_cli("sessions", "export", "--runner", "cc", "--session-id", "safe",
+                            "--out", str(linked), "--force", "--json")
+        self.assertEqual(proc.returncode, 1)
+        source.write_bytes(b"not JSON\n")
+        proc = self.run_cli("sessions", "export", "--runner", "cc", "--session-id", "safe",
+                            "--out", str(out), "--json")
+        self.assertEqual((proc.returncode, json.loads(proc.stdout)["status"]), (1, "ERROR"))
+        self.assertFalse(out.exists())
 
 
 if __name__ == "__main__":
