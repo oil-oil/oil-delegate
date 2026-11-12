@@ -1,9 +1,9 @@
 ---
 name: oil-delegate
-description: "把边界清楚的单次任务委托给 Claude Code（cc）、WorkBuddy（wb）、Antigravity（agy）、Codex、OpenCode、DeepSeek Harness（dsh）、Grok Build（grok）或 Kimi Code（kimi）CLI，返回结构化结果并续接原会话；处理首次静默扫描、启用执行器与默认选择。用户明确要求 oil-delegate、统一调用或用上述全称/别名继续这些外部 CLI Agent 时使用；不用于普通直接问答、显式 /codex、需要主线看板与多话题编排的请求。"
+description: "把边界清楚的单次任务委托给 Claude Code（cc）、WorkBuddy（wb）、Antigravity（agy）、Codex、OpenCode、DeepSeek Harness（dsh）、Grok Build（grok）或 Kimi Code（kimi）CLI，返回结构化结果并续接原会话；处理首次静默扫描、启用执行器与默认选择，并可按用途（代码审查、方案挑刺、疑难会诊、实现）记住各自交给谁。用户明确要求 oil-delegate、统一调用或用上述全称/别名继续这些外部 CLI Agent 时使用；不用于普通直接问答、显式 /codex、需要主线看板与多话题编排的请求。"
 license: MIT
 metadata:
-  version: "0.3.0"
+  version: "0.5.0"
 ---
 
 # oil-delegate
@@ -13,7 +13,7 @@ metadata:
 ## 核心规则
 
 - 用户只说自然语言，由当前 Agent 执行包装器，不要求用户另开终端。
-- 每次只委托一个边界清楚的任务；用户点名的 runner 优先，未点名时使用默认值，不自动换 runner。
+- 每次只委托一个边界清楚的任务；用户点名的 runner 优先，按角色委托时用该角色保存的选择，其余情况使用默认值，不自动换 runner。
 - 沿用各 CLI 的模型、provider 与登录，不传递或保存密钥，不把密钥写入提示词。
 - 调用方负责范围、权限和最终验收；外部 Agent 的自报结果不能替代工作区检查与真实测试。
 
@@ -21,9 +21,10 @@ metadata:
 
 | 模式 | 适用情况 | 路径 | 默认停止点 |
 | --- | --- | --- | --- |
-| 首次 Onboarding | `run` 返回 `NEEDS_ONBOARDING`，或用户要求重配 | 静默扫描 → 用户确认启用池与默认项 → 保存 | 已有任务继续执行；仅重配时结束 |
+| 首次 Onboarding | 未指定 `--runner` 且 `run` 返回 `NEEDS_ONBOARDING`，或用户要求重配 | 静默扫描 → 用户确认启用池与默认项 → 保存 | 已有任务继续执行；仅重配时结束 |
 | 新任务 | 把一次分析、评审或修改交给外部 Agent | 整理委托契约 → `run` → 读取结果并验收 | 汇报结论与验证证据 |
 | 续接任务 | 对同一 CLI 的上一轮结果追问或返工 | 核对 runner 与 session ID → `run --session` | 汇报本轮变化 |
+| 按角色委托 | 其他 Skill 委托审查、方案挑刺、会诊或实现 | `run --role` → 按返回状态处理 | 汇报结论与验证证据 |
 | 配置与诊断 | 查看环境、预览权限或处理失败 | `onboard --scan`、`config`、`run --dry-run` | 给出明确下一步 |
 
 ## 委托契约
@@ -42,9 +43,11 @@ metadata:
 
 ### 1. Onboarding 与 runner 选择
 
-首次使用或收到 `NEEDS_ONBOARDING` 时：
+未完成 onboarding 时，显式传入 `--runner <已安装名称或别名>` 会直接执行该 CLI（不写 `config.json`、不阻塞在首次引导）；只有省略 `--runner` 的首次默认委托才会返回 `NEEDS_ONBOARDING`。已完成 onboarding 后，显式点名未启用的 runner 仍会报错拒绝，不会静默替换。
 
-1. 首次 `run` 已自动完成静默扫描并返回 detected/installed runners，无需用户执行任何命令。需要刷新时运行 `DELEGATE onboard --scan`。扫描不写配置、不读取凭据、不调用模型、不安装、不登录。
+收到 `NEEDS_ONBOARDING` 或用户要求配置启用池与默认项时：
+
+1. 首次省略 `--runner` 的 `run` 已自动完成静默扫描并返回 detected/installed runners，无需用户执行任何命令。需要刷新时运行 `DELEGATE onboard --scan`。扫描不写配置、不读取凭据、不调用模型、不安装、不登录。
 2. 展示已安装 runner、版本、来源、能力和 aliases，说明“已安装不等于已认证”。首次配置前读 [Runner 适配参考](references/runners.md)，讲清 read/write 权限差异、外部服务费用与任务文本会交给对应 provider。
 3. 询问启用哪些 runner，以及默认使用一个还是每次询问。得到回答后才保存：
    ```text
@@ -67,7 +70,7 @@ DELEGATE config --set-bin <runner>=<可执行文件绝对路径>
 ### 2. 派发新任务
 
 - 默认省略 `--mode`，使用 `write` 和各 CLI 的最高权限；分析、探索和评审也不自动降级。
-- 只有用户明确要求只读、plan 或限制权限时才使用 `--mode read`。Kimi 的非交互模式自带 auto 权限，不能保证只读，因此拒绝 read，不伪装支持。
+- 只有用户明确要求只读、plan 或限制权限时才使用 `--mode read`；按读类角色委托时由角色自动只读。Kimi 的非交互模式自带 auto 权限，不能保证只读，因此拒绝 read，不伪装支持。
 - 默认使用当前工作目录，跨项目时显式指定 `--workspace`。
 - 调用：
 
@@ -79,6 +82,28 @@ DELEGATE run --runner <名称> \
 ```
 
 已配置默认 runner 时省略 `--runner`。启动前需要核对参数时追加 `--dry-run`；预览不会启动外部 Agent。
+
+### 按角色委托
+
+`oil-plan`、`oil-code-review`、`oil-govern` 按用途委托时使用 `--role`，由用户保存的偏好决定交给谁：
+
+| 角色 | 用途 | 权限 |
+| --- | --- | --- |
+| `review` | 独立代码审查 | 只读 |
+| `critique` | 动手前的方案挑刺 | 只读 |
+| `diagnose` | 疑难问题双模型会诊：保存两个不同选择，用 `--role-slot 1` 和 `--role-slot 2` 分别调用 | 只读 |
+| `implement` | 按已确认方案实现 | 写入 |
+
+```text
+DELEGATE run --role review --workspace "<项目绝对路径>" --prompt "<审查范围与要求>"
+```
+
+- 读类角色自动只读，不要再传 `--mode`；Kimi 不能保证只读，不能配给读类角色。
+- 返回 `NEEDS_ROLE_CHOICE`（退出码 12）：这个角色还没选过 Agent。把 `candidates` 给用户看并问一次（`host` 表示由当前 Agent 自己开一个全新子 Agent 来做）。用户希望记住时保存 `DELEGATE config --set-role review=<选择>`（`diagnose` 写两个，用逗号分隔）；只用这一次就改传 `--runner`。
+- 返回 `USE_HOST`（退出码 13）：用户偏好由当前 Agent 自己做。改用宿主的全新子 Agent，按角色权限完成，不调用外部 CLI。
+- 显式传 `--runner` 时以它为准，权限仍由角色决定。
+- 用户说“以后 review 都用 codex”这类话时，直接用 `config --set-role` 保存；`--set-role review=ask` 清除。`review` 或 `critique` 与 `implement` 选了同一个 runner 时，配置结果会带 `warnings`，转告用户换一个更能保证独立视角。
+- 角色偏好是个人配置，保存在 oil-delegate 自己的配置目录，不写进项目文件。
 
 ### 3. 续接原会话
 
@@ -105,9 +130,23 @@ DELEGATE sessions --runner anti --query "标题关键词" --json
 
 省略 `--runner` 搜索全部已接入来源；名称和别名沿用统一解析，新增 `anti` → `antigravity`。关键词仅匹配标题，忽略大小写；完全相等的标题优先，其余按更新时间倒序，`--limit` 为正整数，默认 20。
 
-只读取会话元数据，不读取对话正文、不调用模型、不联网、不写配置或运行产物。JSON 经 `emit()` 输出，`contract_version` 仍为 1：`status: OK`、`sessions`、`unsupported`、`errors`、`skipped`。每条会话包含 `runner`、`session_id`、`title`、`workspace`、`updated_at`、`resume_command`、`source`；时间统一为 UTC ISO 8601，缺失目录或时间为 `null`，未命名标题为空字符串。坏行逐行跳过，数量记入 `skipped[runner]`；来源读取失败才记录在 `errors`，保留其他来源结果，退出码仍为 0。
+列表只读取会话元数据，不读取对话正文、不调用模型、不联网、不写配置或运行产物。JSON 经 `emit()` 输出，`contract_version` 仍为 1：`status: OK`、`sessions`、`unsupported`、`errors`、`skipped`。每条会话包含 `runner`、`session_id`、`title`、`workspace`、`updated_at`、`resumable`、`resume_command`、`source`；时间统一为 UTC ISO 8601，缺失目录或时间为 `null`，未命名标题为空字符串。`resumable=false` 时 `resume_command=null`，不要尝试直接续接。坏行逐行跳过，数量记入 `skipped[runner]`；来源读取失败才记录在 `errors`，保留其他来源结果，退出码仍为 0。
 
-已接入 Kimi 官方列表、Codex 本地索引与 Antigravity 本地数据库。来源限制、未支持原因和数据根目录环境变量见 [Runner 适配参考](references/runners.md#会话发现约束)。
+已接入 Kimi 官方列表、Codex 本地索引、Antigravity IDE/CLI 本地数据库与 macOS Claude 桌面元数据。`source=desktop-store` 表示桌面来源：Antigravity IDE 会话不能由 agy 续接；Claude 使用 `cliSessionId`，对应 JSONL 存在时可续接。来源限制和数据根目录环境变量见 [Runner 适配参考](references/runners.md#会话发现约束)。
+
+### 导出会话交接到新 CLI 会话
+
+无法直接续接时，先导出交接文件：
+
+```text
+DELEGATE sessions export --runner <名称> --session-id <ID> --out "<交接文件.md>" --json
+```
+
+目前支持 Antigravity IDE/CLI 与 Claude（含桌面来源）；其他 runner 返回 `status: ERROR`。导出仅离线读取指定会话，写入 Markdown 的标题、目录、时间和按时间排列的用户/Agent 文字，跳过思考、工具、图片与二进制。`--max-turns N` 默认 30，一条用户消息或一条 Agent 回复计一轮；保留最近 N 轮，开头注明省略轮数。Antigravity 只读已 checkpoint 的快照，内部字段依据与限制见 [Runner 适配参考](references/runners.md#会话导出约束)。
+
+输出父目录必须存在；已有文件默认报错，显式加 `--force` 才覆盖，禁止将输出写入 CLI 数据目录。JSON 返回 `status`、`path`、`title`、`workspace`、`turns`、`omitted_turns`、`runner`、`session_id`，另带 `contract_version: 1`。错误返回 `status: ERROR` 并以非零退出。
+
+将交接文件作为新任务的 `--file` 输入，并在 prompt 说明它是历史背景、待完成目标与当前工作区；文件位于工作区外时先复制到工作区。新建 `run` 时省略 `--session`，使用返回的新 `session_id` 跟踪后续任务。
 
 ### 4. 验收与失败恢复
 
@@ -121,7 +160,7 @@ DELEGATE sessions --runner anti --query "标题关键词" --json
 
 成功后脚本输出 `status`、`session_id`、`runner`、`output_path`、`result_path`、`events_path` 和 `elapsed`。每次运行有独立目录，包含 prompt、精简 Markdown、结构化 result、原始 stdout/stderr 与事件日志。result 里的 `resume_command` 是用户在终端直接续接该会话的命令。
 
-给其他程序调用时追加 `--json`：stdout 只输出一个 JSON 对象，带 `contract_version`（当前为 1）。成功、失败、`NEEDS_ONBOARDING`、`NEEDS_RUNNER_CHOICE`、`DRY_RUN` 和参数错误（`status: ERROR`）都用这个格式，退出码与普通模式一致。
+给其他程序调用时追加 `--json`：stdout 只输出一个 JSON 对象，带 `contract_version`（当前为 1）。成功、失败、`NEEDS_ONBOARDING`、`NEEDS_RUNNER_CHOICE`、`NEEDS_ROLE_CHOICE`、`USE_HOST`、`DRY_RUN` 和参数错误（`status: ERROR`）都用这个格式，退出码与普通模式一致。
 
 最终回复只保留用户需要的结论、实际改动、验证证据、未完成事项和必要 session ID。完成当前委托与验收后停止，不扩展成多话题管理，也不自动生成看板。
 
