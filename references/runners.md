@@ -19,7 +19,7 @@
 
 正式 Runner 名为 `claude`、`workbuddy`、`antigravity`、`codex`、`opencode`、`dsh`、`grok`、`kimi`。别名包括 `cc/claude-code`、`wb/codebuddy/cbc`、`agy/anti`、`deepseek/deepseek-harness`、`grok-build`、`kimi-code`。名称不区分大小写；启用、默认 Runner、单次委托和二进制路径配置都使用同一套别名解析，保存时统一转为正式 Runner 名。
 
-优先级：环境变量 `OIL_DELEGATE_<RUNNER>_BIN` → 配置中的 runner path → PATH → 已知安装目录。所有调用使用 argv 数组，prompt 不经过 shell。常规调用不指定模型、provider 或思考强度。
+优先级：环境变量 `OIL_DELEGATE_<RUNNER>_BIN` → 配置中的 runner path → PATH → 已知安装目录。所有调用使用 argv 数组，prompt 不经过 shell。Windows 上若二进制是 npm 生成的 `.cmd`/`.bat` 包装，启动前会解析出它真正调用的程序（exe，或 node 加脚本）并直接执行，绕开 `cmd.exe` 对 `%*` 的处理；多行 prompt 和换行之后的 flag 因此不会被截断。解析不了的包装仍按原样启动。常规调用不指定模型、provider 或思考强度。
 
 省略 `--mode` 时默认 `write`，使用各 CLI 的最高可用权限，尽量避免无人值守任务停在常规审批。只有用户明确要求只读、plan 或限制权限时才使用 `read`。权限参数只影响当前进程，不修改目标 CLI 的永久配置。
 
@@ -28,7 +28,7 @@
 ## Claude Code
 
 - 发现：`claude`。
-- 新建：`claude -p <prompt> --output-format json`；续接增加 `--resume <session_id>`。
+- 新建：`claude -p --input-format text --output-format json`，prompt 从 stdin 传入；续接增加 `--resume <session_id>`。prompt 不放进 `-p` 的参数：Windows 上 claude 是 `.cmd` 包装，`cmd.exe` 会在第一个换行处截断参数，后续 flag 随之丢失。
 - read：`--permission-mode plan --permission-prompts none`。
 - write：`--dangerously-skip-permissions`。
 - 解析：最终 JSON 的 `session_id`、`result`、`is_error`。
@@ -39,7 +39,7 @@
 ## WorkBuddy
 
 - 发现：PATH 中的 `codebuddy` 或 `cbc`；macOS 还检测 WorkBuddy App 的 `Contents/Resources/app.asar.unpacked/cli/bin/codebuddy`。Runner 名仍为 `workbuddy`。
-- 新建：`codebuddy -p <prompt> --output-format json`；续接增加 `--resume <session_id>`。
+- 新建：`codebuddy -p --output-format json`，prompt 从 stdin 传入；续接增加 `--resume <session_id>`。与 claude 相同，prompt 不作为 `-p` 的参数，以免 Windows 的 `.cmd` 包装在换行处截断它。
 - read：`--permission-mode plan -y`。`-y` 让读取等常规授权可无人值守，plan 限制实施修改。
 - write：`--permission-mode bypassPermissions -y`，并设置 `CODEBUDDY_IS_SANDBOX=1`，同时放行 HIGH/CRITICAL 操作。这是用户选择的最高权限模式，不代表进程实际处于隔离沙箱。
 - 进程环境：所有模式设置 `CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS=1`，避免 single-shot 模式不支持的后台任务。

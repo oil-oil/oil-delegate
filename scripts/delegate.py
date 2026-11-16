@@ -5,6 +5,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -191,6 +192,84 @@ def is_executable(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
 
+# Windows CLIs usually ship as .cmd shims that hand their arguments to cmd.exe
+# through %*. Python's list2cmdline does not quote a newline, so cmd.exe splits a
+# multi-line prompt at the first line and drops every flag that follows it. Each
+# shim shape below is resolved to the program it actually launches, so the whole
+# argv list reaches that program directly.
+_SHIM_EXE = re.compile(r'"%dp0%\\([^"]+\.(?:exe|com))"\s+%\*', re.IGNORECASE)
+_SHIM_NODE = re.compile(r'"%_prog%"\s+(?:((?:--\S+\s+)+))?"%dp0%\\([^"]+)"\s+%\*', re.IGNORECASE)
+# Anchored to the whole line: a wrapper such as `"%~dp0app.exe" --flag "%~dp0cli.js" %*`
+# also ends in "%~dp0…" %*, and launching that script alone would drop the exe.
+_SHIM_DIRECT = re.compile(r'^\s*"%~dp0([^"]+)"\s+%\*\s*$', re.IGNORECASE | re.MULTILINE)
+# Hand-written wrappers, including the test fixture: "<exe>" ["<script>"] %*
+_SHIM_QUOTED = re.compile(r'^"([^"]+)"(?:\s+"([^"]+)")?\s+%\*\s*$', re.IGNORECASE)
+
+
+def _existing_file(path: Path) -> Path | None:
+    return path if path.is_file() else None
+
+
+def resolve_windows_shim(binary: str) -> list[str] | None:
+    """Return the argv prefix a .cmd/.bat shim really launches, or None to keep it."""
+    path = Path(binary)
+    if path.suffix.lower() not in {".cmd", ".bat"} or not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    root = path.parent
+
+    match = _SHIM_NODE.search(text)
+    if match:
+        target = _existing_file(root / match.group(2))
+        if target is None:
+            return None
+        node = _existing_file(root / "node.exe")
+        prefix = [str(node if node else shutil.which("node") or "node")]
+        if match.group(1):
+            prefix.extend(match.group(1).split())
+        return [*prefix, str(target)]
+
+    # An npm node shim also names node.exe in an IF EXIST check, so the exe
+    # pattern runs after the node pattern and skips targets that do not exist.
+    for match in _SHIM_EXE.finditer(text):
+        target = _existing_file(root / match.group(1))
+        if target:
+            return [str(target)]
+
+    match = _SHIM_DIRECT.search(text)
+    if match:
+        target = _existing_file(root / match.group(1))
+        return [str(target)] if target else None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or "%" in line.replace("%*", ""):
+            continue
+        match = _SHIM_QUOTED.fullmatch(line)
+        if not match:
+            continue
+        exe = _existing_file(Path(match.group(1)))
+        if exe is None:
+            return None
+        script = match.group(2)
+        if not script:
+            return [str(exe)]
+        script_path = _existing_file(Path(script))
+        return [str(exe), str(script_path)] if script_path else None
+    return None
+
+
+def launch_command(command: list[str]) -> list[str]:
+    """Rewrite a shim's own path out of the argv, leaving the caller's flags intact."""
+    if os.name != "nt" or not command:
+        return command
+    resolved = resolve_windows_shim(command[0])
+    return [*resolved, *command[1:]] if resolved else command
+
+
 def detect_binary(runner: str, config: dict[str, Any]) -> dict[str, Any]:
     env_key = f"OIL_DELEGATE_{runner.upper()}_BIN"
     configured = os.environ.get(env_key) or config.get("runner_paths", {}).get(runner)
@@ -250,9 +329,11 @@ def detect_binary(runner: str, config: dict[str, Any]) -> dict[str, Any]:
 def probe_version(path: str) -> dict[str, Any]:
     try:
         proc = subprocess.run(
-            [path, "--version"],
+            launch_command([path, "--version"]),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=False,
         )
@@ -268,9 +349,11 @@ def probe_version(path: str) -> dict[str, Any]:
 def probe_dsh_capabilities(path: str) -> dict[str, bool | str | None]:
     try:
         proc = subprocess.run(
-            [path, "--profile", "headless", "--help"],
+            launch_command([path, "--profile", "headless", "--help"]),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             check=False,
         )
@@ -627,22 +710,25 @@ def build_invocation(
     stdin_input: str | None = None
 
     if runner == "claude":
-        cmd = [binary]
+        # Prompt goes on stdin for the same reason as workbuddy: claude is a .cmd
+        # shim on Windows and cmd.exe truncates a multi-line -p argument.
+        cmd = [binary, "-p", "--input-format", "text", "--output-format", "json"]
         if session_id:
             cmd.extend(["--resume", session_id])
-        cmd.extend(["-p", prompt, "--output-format", "json"])
         cmd.extend(
             ["--permission-mode", "plan", "--permission-prompts", "none"]
             if mode == "read"
             else ["--dangerously-skip-permissions"]
         )
-        return cmd, stdin_input, env
+        return cmd, prompt, env
 
     if runner == "workbuddy":
-        cmd = [binary]
+        # Pass the prompt on stdin, not as the -p argument. codebuddy ships as a
+        # .cmd wrapper, and cmd.exe cuts an argument at the first newline, which
+        # drops every flag after -p and makes the CLI reply in plain text.
+        cmd = [binary, "-p", "--output-format", "json"]
         if session_id:
             cmd.extend(["--resume", session_id])
-        cmd.extend(["-p", prompt, "--output-format", "json"])
         cmd.extend(
             ["--permission-mode", "plan", "-y"]
             if mode == "read"
@@ -651,7 +737,7 @@ def build_invocation(
         env["CODEBUDDY_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
         if mode == "write":
             env["CODEBUDDY_IS_SANDBOX"] = "1"
-        return cmd, stdin_input, env
+        return cmd, prompt, env
 
     if runner == "antigravity":
         cmd = [binary]
@@ -1049,7 +1135,7 @@ def execute_run(
 
     try:
         proc = subprocess.Popen(
-            command,
+            launch_command(command),
             cwd=str(workspace),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

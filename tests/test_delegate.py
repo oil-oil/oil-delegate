@@ -138,7 +138,16 @@ class DelegateTestCase(unittest.TestCase):
         path = self.bin_dir / runner
         path.write_text(FAKE_CLI.format(python=sys.executable, runner=runner), encoding="utf-8")
         path.chmod(0o755)
-        return path
+        if os.name != "nt":
+            return path
+        # Windows cannot execute an extensionless script, so route through a .cmd
+        # wrapper like npm-installed CLIs use. The wrapper also exercises the same
+        # cmd.exe argument handling that real runners go through.
+        wrapper = self.bin_dir / f"{runner}.cmd"
+        wrapper.write_text(
+            f'@echo off\r\n"{sys.executable}" "{path}" %*\r\n', encoding="utf-8", newline=""
+        )
+        return wrapper
 
     def base_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -417,6 +426,9 @@ class DelegateTestCase(unittest.TestCase):
                     self.assertFalse(any("inspect the fixture" in part for part in result["command"]))
                     if runner in ("codex", "dsh"):
                         self.assertEqual(result["command"][-1], "-")
+                    elif runner in ("claude", "workbuddy"):
+                        self.assertNotIn("<prompt>", result["command"])
+                        self.assertIn("inspect the fixture", record["stdin"])
                     else:
                         self.assertIn("<prompt>", result["command"])
                     for artifact in (result["output_path"], result["events_path"], result["raw_stdout_path"], result["stderr_path"]):
@@ -840,6 +852,81 @@ class DelegateTestCase(unittest.TestCase):
         self.assertEqual(result["events_path"], result["raw_stdout_path"])
         self.assertTrue(Path(result["events_path"]).is_file())
         self.assertNotIn("run_timeout_seconds", DELEGATE.default_config())
+
+
+class WindowsShimTestCase(unittest.TestCase):
+    """The .cmd shapes that npm and hand-written wrappers ship."""
+
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp_dir.name).resolve()
+
+    def tearDown(self) -> None:
+        self.tmp_dir.cleanup()
+
+    def write(self, name: str, body: str) -> Path:
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8", newline="")
+        return path
+
+    def test_npm_exe_shim(self) -> None:
+        target = self.write("node_modules/pkg/bin/cli.exe", "")
+        shim = self.write("cli.cmd", '@ECHO off\r\n"%dp0%\\node_modules\\pkg\\bin\\cli.exe"   %*\r\n')
+        self.assertEqual(DELEGATE.resolve_windows_shim(str(shim)), [str(target)])
+
+    def test_npm_node_shim_prefers_local_node(self) -> None:
+        node = self.write("node.exe", "")
+        script = self.write("node_modules/pkg/bin/cli", "")
+        shim = self.write(
+            "cli.cmd",
+            '@ECHO off\r\nIF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n'
+            '  SET "_prog=node"\r\n)\r\nendLocal & goto #_undefined_# 2>NUL || "%_prog%"  '
+            '"%dp0%\\node_modules\\pkg\\bin\\cli" %*\r\n',
+        )
+        self.assertEqual(DELEGATE.resolve_windows_shim(str(shim)), [str(node), str(script)])
+
+    def test_npm_node_shim_keeps_node_flags(self) -> None:
+        script = self.write("node_modules/pkg/bin/cli", "")
+        shim = self.write(
+            "cli.cmd",
+            '"%_prog%" --experimental-strip-types "%dp0%\\node_modules\\pkg\\bin\\cli" %*\r\n',
+        )
+        resolved = DELEGATE.resolve_windows_shim(str(shim))
+        self.assertEqual(resolved[1:], ["--experimental-strip-types", str(script)])
+
+    def test_dp0_direct_shim(self) -> None:
+        target = self.write("bin/app.exe", "")
+        shim = self.write("bin/app.cmd", '"%~dp0app.exe" %*\r\n')
+        self.assertEqual(DELEGATE.resolve_windows_shim(str(shim)), [str(target)])
+
+    def test_dp0_wrapper_with_flags_is_left_alone(self) -> None:
+        # The shape DeepSeek Harness ships: an exe, a flag, then a script, plus an
+        # environment variable the shim sets. Only the shim itself runs it correctly.
+        self.write("app.exe", "")
+        self.write("lib/cli.js", "")
+        shim = self.write(
+            "app.cmd",
+            '@echo off\r\nset "ELECTRON_RUN_AS_NODE=1"\r\n'
+            '"%~dp0app.exe" --expose-internals "%~dp0lib\\cli.js" %*\r\n',
+        )
+        self.assertIsNone(DELEGATE.resolve_windows_shim(str(shim)))
+
+    def test_quoted_wrapper_with_script(self) -> None:
+        script = self.write("fake.py", "")
+        shim = self.write("wrap.cmd", f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n')
+        self.assertEqual(DELEGATE.resolve_windows_shim(str(shim)), [sys.executable, str(script)])
+
+    def test_unresolved_shim_is_left_alone(self) -> None:
+        shim = self.write("mystery.cmd", '@echo off\r\ncall somewhere\r\n')
+        self.assertIsNone(DELEGATE.resolve_windows_shim(str(shim)))
+        self.assertEqual(DELEGATE.launch_command([str(shim), "--flag"]), [str(shim), "--flag"])
+
+    def test_non_windows_keeps_the_command(self) -> None:
+        shim = self.write("cli.cmd", '"%dp0%\\cli.exe" %*\r\n')
+        self.write("cli.exe", "")
+        with mock.patch.object(DELEGATE.os, "name", "posix"):
+            self.assertEqual(DELEGATE.launch_command([str(shim), "a"]), [str(shim), "a"])
 
 
 if __name__ == "__main__":
